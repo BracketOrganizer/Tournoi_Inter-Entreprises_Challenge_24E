@@ -61,8 +61,10 @@ const ST = {
   teams:[],        // [{id,name,club,licence,lv}]  -- 24 équipes d'entreprises
   pools:{A:[],B:[],C:[],D:[]}, // ids d'équipes par poule
   poolSchedule:[], // matchs de phase de poules [{m,pool,a,b,time,court}]
+  poolTabSlot:null,    // créneau "TAB possible" réservé en fin de phase de poules {time,slot}
   bracketSchedule:[], // matchs phase finale [{m,time,court}]
-  results:{},      // clé "pool-M" ou "bracket-M" -> {ga,gb,forfeit,shootout:{ga,gb}}
+  bracketTabSlots:[],  // créneaux "TAB possible" après chaque tour [{round,slot,time}]
+  results:{},      // clé "pool-M" ou "bracket-M" -> {ga,gb,shootout:{ga,gb}}
   activeView:'pools', // 'pools' | 'bracket'
   activePoolRound:0,
   activeBracketRound:1, // 1,2,3
@@ -76,12 +78,12 @@ const ST = {
     matchDurBracket:12,   // durée match phase finale (min)
     tt:4,                 // transition entre matchs (min)
     start:'09:00',
-    lunchBreak:true,
-    lunchStart:'12:00',
-    lunchDuration:45,
+    // Coupures multiples (déjeuner, pauses...) : chacune démarre à la fin du
+    // créneau en cours le plus proche de l'heure visée (jamais en plein milieu
+    // d'un créneau), peu importe qu'on soit en phase de poules ou en finale.
+    breaks:[ { time:'12:00', duration:45, label:'Pause déjeuner' } ],
     shootoutBreaks:true,  // pauses tirs au but signalées à certains tours
-    draw:'order',         // 'order' | 'random' | 'random-no-club'
-    forfeitScore:3         // score du vainqueur en cas de forfait (3-0 par règlement)
+    draw:'order'           // 'order' | 'random' | 'random-no-club'
   }
 };
 
@@ -97,7 +99,72 @@ function addMinutes(timeStr, mins){
   const mm = total%60;
   return String(hh).padStart(2,'0')+':'+String(mm).padStart(2,'0');
 }
+function timeToMinutes(timeStr){
+  const [h,m] = (timeStr||'09:00').split(':').map(Number);
+  return h*60+m;
+}
+
+// ══════════════════════════════════════════════════════════
+// TIMELINE CONTINUE AVEC COUPURES MULTIPLES
+// Calcule l'horaire de chaque créneau (slot 0,1,2...) en partant de `startTime`,
+// chaque créneau durant `slotDuration` minutes. Les coupures (ST.cfg.breaks)
+// s'insèrent dès que l'horaire du créneau EN COURS atteint ou dépasse l'heure
+// de la coupure : la coupure démarre alors à la FIN de ce créneau (jamais en
+// plein milieu), et tout ce qui suit est décalé d'autant. Une coupure ne peut
+// s'appliquer qu'une seule fois sur l'ensemble de la timeline (poules+finale).
+// Retourne un tableau de chaînes "HH:MM", une par slot, indexé comme l'argument
+// `slotCount`.
+// ══════════════════════════════════════════════════════════
+function computeSlotTimes(startTime, slotDuration, slotCount, breaks, appliedBreaksSet){
+  const sortedBreaks = (breaks||[]).slice().sort((a,b)=>timeToMinutes(a.time)-timeToMinutes(b.time));
+  const times = [];
+  let cursor = timeToMinutes(startTime);
+  for(let i=0;i<slotCount;i++){
+    times.push(cursor);
+    const slotEnd = cursor + slotDuration;
+    // Une coupure s'applique si son heure tombe dans [début, fin] de CE créneau
+    // et qu'elle n'a pas déjà été consommée plus tôt dans la timeline.
+    for(const brk of sortedBreaks){
+      const key = brk.time+'_'+brk.duration;
+      if(appliedBreaksSet.has(key)) continue;
+      const brkMin = timeToMinutes(brk.time);
+      if(brkMin >= cursor && brkMin < slotEnd){
+        appliedBreaksSet.add(key);
+        cursor = slotEnd + brk.duration;
+        // on a déjà avancé cursor pour cette coupure ; sort pour ne pas en
+        // appliquer une seconde sur le même créneau (rare mais possible si
+        // deux coupures très proches) — elle sera traitée au slot suivant.
+        break;
+      }
+    }
+    if(cursor === times[i]) cursor = slotEnd; // pas de coupure : avance normalement
+  }
+  return times.map(mins=>{
+    const hh=Math.floor(mins/60)%24, mm=mins%60;
+    return String(hh).padStart(2,'0')+':'+String(mm).padStart(2,'0');
+  });
+}
 function shuffle(arr){ const a=[...arr]; for(let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; } return a; }
+
+// Reconstruit l'ensemble des coupures déjà "consommées" par un planning existant
+// (poules) : une coupure est considérée appliquée si son heure visée tombe avant
+// (ou pendant) la plage couverte par ce planning — c'est-à-dire avant l'heure du
+// dernier créneau. Utilisé quand on génère la phase finale séparément, pour ne
+// pas réappliquer une coupure déjà placée pendant les poules, ni en oublier une
+// qui ne doit s'insérer que dans la finale (heure après la fin des poules).
+function appliedBreaksFromSchedule(existingTimes, breaks){
+  const applied = new Set();
+  if(!existingTimes.length) return applied;
+  const lastSlotMin = Math.max(...existingTimes.map(timeToMinutes));
+  (breaks||[]).forEach(brk=>{
+    const brkMin = timeToMinutes(brk.time);
+    // Si l'heure visée par la coupure est <= au dernier créneau du planning de
+    // référence, c'est qu'elle se situait dans cette portion de la journée et a
+    // donc déjà été traitée (insérée ou non, mais "passée") lors de sa génération.
+    if(brkMin <= lastSlotMin) applied.add(brk.time+'_'+brk.duration);
+  });
+  return applied;
+}
 // ══════════════════════════════════════════════════════════
 // ARBRE PHASE FINALE — 24 équipes, 4 poules de 6 (A,B,C,D)
 // Format exact selon le règlement officiel.
@@ -299,7 +366,9 @@ function subscribeToTournament(){
     if(data.teams)           ST.teams           = data.teams;
     if(data.pools)           ST.pools           = data.pools;
     if(data.poolSchedule)    ST.poolSchedule    = data.poolSchedule;
+    ST.poolTabSlot      = data.poolTabSlot || null;
     if(data.bracketSchedule) ST.bracketSchedule = data.bracketSchedule;
+    ST.bracketTabSlots  = data.bracketTabSlots || [];
     if(data.results)         ST.results         = data.results;
     if(data.phase)           ST.phase           = data.phase;
     ST.liveOpen = data.liveOpen === true;
@@ -479,40 +548,33 @@ window.buildPoolSchedule = function(){
   }
   // Répartition en créneaux de `courts` matchs consécutifs, en respectant l'ordre
   // ci-dessus (donc le 1er match de chaque poule arrive bien dans les 1ers créneaux).
-  const schedule=[];
+  const rawSchedule=[];
   let slotIdx=0;
   for(let j=0;j<numJournees;j++){
     const journeeMatches = allMatches.filter(m=>m.journee===j);
     for(let i=0;i<journeeMatches.length;i+=courts){
       const slot = journeeMatches.slice(i,i+courts);
-      const time = addMinutes(cfg.start, slotIdx*(cfg.matchDur+cfg.tt));
       slot.forEach((m,ci)=>{
-        schedule.push({ ...m, time, court:ci+1, slot:slotIdx });
+        rawSchedule.push({ ...m, court:ci+1, slot:slotIdx });
       });
       slotIdx++;
     }
   }
+  // + 1 créneau réservé "TAB possible" en toute fin de phase de poules (slot
+  // supplémentaire, n'affecte pas le classement, purement informatif/optionnel).
+  const tabSlotIdx = slotIdx; // dernier slot = TAB
+  const totalSlots = slotIdx+1;
 
-  // Insertion de la pause déjeuner : décale tous les horaires après le point médian
-  let finalSchedule = schedule;
-  if(cfg.lunchBreak){
-    const totalSlots = slotIdx;
-    const midSlot = Math.ceil(totalSlots/2);
-    const lunchEndTime = addMinutes(cfg.lunchStart, cfg.lunchDuration);
-    finalSchedule = schedule.map(m=>{
-      if(m.slot < midSlot){
-        return { ...m, time: addMinutes(cfg.start, m.slot*(cfg.matchDur+cfg.tt)) };
-      } else {
-        const afterSlot = m.slot - midSlot;
-        return { ...m, time: addMinutes(lunchEndTime, afterSlot*(cfg.matchDur+cfg.tt)) };
-      }
-    });
-  }
+  const appliedBreaks = new Set();
+  const slotTimes = computeSlotTimes(cfg.start, cfg.matchDur+cfg.tt, totalSlots, cfg.breaks, appliedBreaks);
+
+  const finalSchedule = rawSchedule.map(m=>({ ...m, time: slotTimes[m.slot] }));
 
   ST.poolSchedule = finalSchedule;
+  ST.poolTabSlot = { time: slotTimes[tabSlotIdx], slot: tabSlotIdx }; // créneau TAB de poule (info)
   ST.results = {};
   ST.phase='pools';
-  saveTournament({ poolSchedule: finalSchedule, results:{}, phase:'pools', bracketSchedule:[] });
+  saveTournament({ poolSchedule: finalSchedule, poolTabSlot: ST.poolTabSlot, results:{}, phase:'pools', bracketSchedule:[] });
   renderPlanningPreview();
 };
 
@@ -639,25 +701,48 @@ window.generateBracket = function(){
 
   const cfg = ST.cfg;
   const courts = cfg.courts||4;
-  const start = cfg.lunchBreak ? addMinutes(cfg.lunchStart, cfg.lunchDuration) : cfg.start;
 
-  // Construit les créneaux horaires pour chaque tour du bracket (12,12,12 matchs)
-  const schedule=[];
+  // Départ de la phase finale = juste après le dernier créneau de poules
+  // (TAB de poule inclus), en continuité de la même timeline — la phase finale
+  // ne redémarre plus après une pause fixe : les coupures peuvent désormais
+  // tomber n'importe où, y compris pendant les poules.
+  const lastPoolTime = ST.poolTabSlot ? ST.poolTabSlot.time
+    : (ST.poolSchedule.length ? ST.poolSchedule[ST.poolSchedule.length-1].time : cfg.start);
+  const start = addMinutes(lastPoolTime, cfg.matchDur+cfg.tt);
+
+  // Construit les créneaux horaires pour chaque tour du bracket (12,12,12 matchs),
+  // avec un créneau "TAB possible" systématique inséré après CHAQUE tour
+  // (au cas où un ou plusieurs matchs du tour se terminent à égalité).
+  const rawSchedule=[];
+  const tabSlots=[]; // { round, slot }
   let slotIdx=0;
   [BRACKET_ROUND1, BRACKET_ROUND2, BRACKET_ROUND3].forEach((round,ri)=>{
     for(let i=0;i<round.length;i+=courts){
       const slot = round.slice(i,i+courts);
-      const time = addMinutes(start, slotIdx*(cfg.matchDurBracket+cfg.tt));
       slot.forEach((b,ci)=>{
-        schedule.push({ m:b.m, round:ri+1, time, court:ci+1, slot:slotIdx, label: b.label||null });
+        rawSchedule.push({ m:b.m, round:ri+1, court:ci+1, slot:slotIdx, label: b.label||null });
       });
       slotIdx++;
     }
+    // créneau TAB systématique après ce tour
+    tabSlots.push({ round: ri+1, slot: slotIdx });
+    slotIdx++;
   });
 
+  const totalSlots = slotIdx;
+  // Reprend les coupures déjà consommées pendant les poules (pour ne pas les
+  // réappliquer), puis poursuit la timeline sur la phase finale.
+  const poolTimes = ST.poolSchedule.map(m=>m.time).concat(ST.poolTabSlot?[ST.poolTabSlot.time]:[]);
+  const appliedBreaks = appliedBreaksFromSchedule(poolTimes, cfg.breaks);
+  const slotTimes = computeSlotTimes(start, cfg.matchDurBracket+cfg.tt, totalSlots, cfg.breaks, appliedBreaks);
+
+  const schedule = rawSchedule.map(m=>({ ...m, time: slotTimes[m.slot] }));
+  const tabSlotsWithTime = tabSlots.map(t=>({ ...t, time: slotTimes[t.slot] }));
+
   ST.bracketSchedule = schedule;
+  ST.bracketTabSlots = tabSlotsWithTime; // créneaux TAB après chaque tour (info)
   ST.phase = 'bracket';
-  saveTournament({ bracketSchedule: schedule, phase:'bracket' });
+  saveTournament({ bracketSchedule: schedule, bracketTabSlots: tabSlotsWithTime, phase:'bracket' });
   renderTournamentPage();
 };
 
@@ -1043,6 +1128,49 @@ window.goToLive = function(){ goTo(4); closeMobileMenu(); };
 // ══════════════════════════════════════════════════════════
 // PAGE 1 — CONFIG
 // ══════════════════════════════════════════════════════════
+let _breaksDraft = [{ time:'12:00', duration:45, label:'Pause déjeuner' }]; // édité en page Config
+
+function renderBreaksList(){
+  const el = document.getElementById('breaksList'); if(!el) return;
+  if(!_breaksDraft.length){
+    el.innerHTML = '<div class="info info-y" style="font-size:12px">Aucune coupure prévue.</div>';
+    return;
+  }
+  el.innerHTML = _breaksDraft.map((b,i)=>`
+    <div class="fr" style="align-items:end;margin-bottom:8px">
+      <div>
+        <label>Libellé</label>
+        <input type="text" value="${(b.label||'').replace(/"/g,'&quot;')}" oninput="updateBreakDraft(${i},'label',this.value)" placeholder="Ex : Pause déjeuner">
+      </div>
+      <div>
+        <label>Heure visée</label>
+        <input type="time" value="${b.time}" oninput="updateBreakDraft(${i},'time',this.value)">
+      </div>
+      <div>
+        <label>Durée (min)</label>
+        <input type="number" value="${b.duration}" min="5" max="240" step="5" oninput="updateBreakDraft(${i},'duration',this.value)">
+      </div>
+      <div>
+        <button class="btn btn-ghost btn-sm" style="color:var(--red);border-color:var(--red)" onclick="removeBreakDraft(${i})">🗑 Retirer</button>
+      </div>
+    </div>`).join('');
+}
+window.addBreakRow = function(){
+  _breaksDraft.push({ time:'12:00', duration:30, label:'Coupure' });
+  renderBreaksList();
+  onCfgChange();
+};
+window.removeBreakDraft = function(i){
+  _breaksDraft.splice(i,1);
+  renderBreaksList();
+  onCfgChange();
+};
+window.updateBreakDraft = function(i, field, value){
+  if(!_breaksDraft[i]) return;
+  _breaksDraft[i][field] = field==='duration' ? (+value||0) : value;
+  onCfgChange();
+};
+
 function getCfg(){
   return {
     n:              24, // format officiel fixe : 24 équipes (4 poules de 6)
@@ -1051,35 +1179,25 @@ function getCfg(){
     matchDurBracket:+(document.getElementById('cfg_matchdur_bracket')?.value||12),
     tt:             +(document.getElementById('cfg_tt')?.value||4),
     start:          document.getElementById('cfg_start')?.value||'09:00',
-    lunchBreak:     document.getElementById('cfg_lunch')?.checked!==false,
-    lunchStart:     document.getElementById('cfg_lunchstart')?.value||'12:00',
-    lunchDuration:  +(document.getElementById('cfg_lunchdur')?.value||45),
+    breaks:         _breaksDraft.filter(b=>b.time).map(b=>({ time:b.time, duration:b.duration||0, label:b.label||'Coupure' })),
     draw:           document.getElementById('cfg_draw')?.value||'order',
-    forfeitScore:   +(document.getElementById('cfg_forfeit')?.value||3),
   };
 }
 function renderCfgForm(){
   const c = ST.cfg;
   const setV=(id,v)=>{ const el=document.getElementById(id); if(el) el.value=v; };
-  const setC=(id,v)=>{ const el=document.getElementById(id); if(el) el.checked=v; };
   setV('cfg_n', c.n);
   setV('cfg_courts', c.courts);
   setV('cfg_matchdur', c.matchDur);
   setV('cfg_matchdur_bracket', c.matchDurBracket);
   setV('cfg_tt', c.tt);
   setV('cfg_start', c.start);
-  setC('cfg_lunch', c.lunchBreak!==false);
-  setV('cfg_lunchstart', c.lunchStart);
-  setV('cfg_lunchdur', c.lunchDuration);
   setV('cfg_draw', c.draw||'order');
-  setV('cfg_forfeit', c.forfeitScore||3);
+  _breaksDraft = (c.breaks && c.breaks.length) ? c.breaks.map(b=>({...b})) : [{ time:'12:00', duration:45, label:'Pause déjeuner' }];
+  renderBreaksList();
   onCfgChange();
 }
 window.onCfgChange = function(){
-  const lunchCk  = document.getElementById('cfg_lunch')?.checked;
-  const lunchRow = document.getElementById('lunchRow');
-  if(lunchRow) lunchRow.style.display = lunchCk ? '' : 'none';
-
   const n = +(document.getElementById('cfg_n')?.value||24);
   const courts = +(document.getElementById('cfg_courts')?.value||4);
   const matchDur = +(document.getElementById('cfg_matchdur')?.value||12);
@@ -1090,31 +1208,33 @@ window.onCfgChange = function(){
   const journees = teamsPerPool - (teamsPerPool%2===0?1:0) || teamsPerPool-1;
   const matchesPerJournee = numPools * Math.floor(teamsPerPool/2);
   const slotsNeeded = Math.ceil(matchesPerJournee/courts) * Math.max(1,journees);
-  const poolDuration = slotsNeeded * (matchDur+tt);
+  const poolDuration = (slotsNeeded+1) * (matchDur+tt); // +1 = créneau TAB de poule
 
-  // Estimation phase finale : 36 matchs (12+12+12), répartis sur `courts` terrains
-  const bracketSlots = Math.ceil(12/courts)*3;
+  // Estimation phase finale : 36 matchs (12+12+12) + 3 créneaux TAB, répartis sur `courts` terrains
+  const bracketSlots = Math.ceil(12/courts)*3 + 3;
   const bracketDuration = bracketSlots*(matchDur+tt);
 
   const infoEl = document.getElementById('cfg_info');
   if(infoEl){
     infoEl.className='info info-b';
     infoEl.innerHTML = `🏟️ <strong>${n} équipes</strong> réparties en <strong>4 poules</strong> de ${teamsPerPool} · <strong>${courts} terrain${courts>1?'s':''}</strong><br>
-    📅 Phase de poules : ~<strong>${journees} journées</strong>, durée estimée <strong>${Math.round(poolDuration/60*10)/10}h</strong><br>
-    🏆 Phase finale : <strong>36 matchs</strong> (3 tours), durée estimée <strong>${Math.round(bracketDuration/60*10)/10}h</strong>`;
+    📅 Phase de poules : ~<strong>${journees} journées</strong> + créneau T.A.B., durée estimée <strong>${Math.round(poolDuration/60*10)/10}h</strong><br>
+    🏆 Phase finale : <strong>36 matchs</strong> (3 tours) + créneaux T.A.B., durée estimée <strong>${Math.round(bracketDuration/60*10)/10}h</strong>`;
   }
 
   const start=document.getElementById('cfg_start')?.value||'09:00';
-  const lunchStart=document.getElementById('cfg_lunchstart')?.value||'12:00';
-  const lunchDur=+(document.getElementById('cfg_lunchdur')?.value||45);
-  const poolsEnd = lunchCk ? lunchStart : addMinutes(start, poolDuration);
-  const afterLunch = lunchCk ? addMinutes(lunchStart, lunchDur) : poolsEnd;
-  const bracketEnd = addMinutes(afterLunch, bracketDuration);
+  const totalDuration = poolDuration + bracketDuration;
+  const breaksTotal = _breaksDraft.reduce((s,b)=>s+(b.duration||0),0);
+  const estEnd = addMinutes(start, totalDuration + breaksTotal);
   const el = document.getElementById('cfgPreview');
   if(el){
     el.className='info info-g';
-    el.innerHTML=`☀️ Poules : ${start} → ~${poolsEnd}${lunchCk?` · 🍽️ ${lunchStart} (${lunchDur} min)`:''}<br>
-    🌤️ Phase finale : ~${afterLunch} → ~${bracketEnd} · ⏱ match ${matchDur} min · transition ${tt} min`;
+    const breaksTxt = _breaksDraft.length
+      ? _breaksDraft.map(b=>`☕ ${b.label} ~${b.time} (${b.duration} min)`).join(' · ')
+      : 'Aucune coupure';
+    el.innerHTML=`☀️ Début : ${start} · ⏱ match poules ${matchDur} min / finale ${+(document.getElementById('cfg_matchdur_bracket')?.value||12)} min · transition ${tt} min<br>
+    ${breaksTxt}<br>
+    🏁 Fin estimée ~${estEnd} (estimation, les coupures réelles se caleront sur les créneaux)`;
   }
 };
 window.saveCfgAndNext = async function(){
@@ -1249,16 +1369,23 @@ function renderPlanningPreview(){
   const bySlot = {};
   ST.poolSchedule.forEach(m=>{ (bySlot[m.slot]=bySlot[m.slot]||[]).push(m); });
   const slots = Object.keys(bySlot).map(Number).sort((a,b)=>a-b);
-  el.innerHTML = slots.map(s=>{
+  let html = slots.map(s=>{
     const matches = bySlot[s];
     const time = matches[0].time;
     return `<div style="background:var(--s2);border:1px solid var(--bdr);border-radius:8px;padding:10px 14px;margin-bottom:8px">
-      <div style="font-family:'Oswald',sans-serif;font-size:13px;color:var(--blu);margin-bottom:6px">🕐 ${time}</div>
+      <div style="font-family:'Oswald',sans-serif;font-size:22px;font-weight:700;color:var(--blu);margin-bottom:6px">🕐 ${time}</div>
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:6px">
         ${matches.map(m=>`<div style="font-size:12px"><strong>T${m.court}</strong> Poule ${m.pool} : ${tName(m.a)} – ${tName(m.b)}</div>`).join('')}
       </div>
     </div>`;
   }).join('');
+  if(ST.poolTabSlot){
+    html += `<div style="background:var(--ylw-bg);border:1px dashed var(--ylw);border-radius:8px;padding:10px 14px;margin-bottom:8px">
+      <div style="font-family:'Oswald',sans-serif;font-size:22px;font-weight:700;color:var(--ylw);margin-bottom:2px">🕐 ${ST.poolTabSlot.time}</div>
+      <div style="font-size:12px">⚽ Créneau réservé — <strong>T.A.B. possible</strong> en cas d'égalité parfaite au classement d'une poule (facultatif, ne compte pas pour le classement)</div>
+    </div>`;
+  }
+  el.innerHTML = html;
 }
 window.regeneratePoolSchedule = function(){
   if(!isAdmin()) return;
@@ -1301,7 +1428,7 @@ function buildTeamProgram(tid){
     const done=r.ga!==''&&r.gb!=='';
     const isA=m.a===tid;
     const myS=done?(isA?r.ga:r.gb):'', oppS=done?(isA?r.gb:r.ga):'';
-    rows.push({ phase:'Poule '+m.pool, time:m.time, court:'T'+m.court, opp, myS, oppS, done, forfeit:r.forfeit });
+    rows.push({ phase:'Poule '+m.pool, time:m.time, court:'T'+m.court, opp, myS, oppS, done });
   });
   ST.bracketSchedule.filter(b=>{
     const a=bracketTeam(b.m,'a'), bb=bracketTeam(b.m,'b');
@@ -1313,7 +1440,7 @@ function buildTeamProgram(tid){
     const r=getBracketResult(b.m);
     const done=r.ga!==''&&r.gb!=='';
     const myS=done?(isA?r.ga:r.gb):'', oppS=done?(isA?r.gb:r.ga):'';
-    rows.push({ phase:bracketLabel(b.m), time:b.time, court:'T'+b.court, opp, myS, oppS, done, forfeit:r.forfeit });
+    rows.push({ phase:bracketLabel(b.m), time:b.time, court:'T'+b.court, opp, myS, oppS, done });
   });
   return rows;
 }
@@ -1436,7 +1563,7 @@ function renderPoolsView(){
   if(listEl){
     listEl.innerHTML = matches.map(m=>{
       const r=getPoolResult(m.matchId);
-      return matchCardHTML('pool', m.matchId, m.a, m.b, r, `Poule ${m.pool} · T${m.court}`);
+      return matchCardHTML('pool', m.matchId, m.a, m.b, r, `Poule ${m.pool}`, m.court, m.time);
     }).join('');
   }
 
@@ -1444,20 +1571,36 @@ function renderPoolsView(){
 }
 window.setPoolSlot = function(s){ ST.activePoolRound=s; renderPoolsView(); };
 
+const POOL_COLORS = {
+  A: { main:'#2f6fed', bg:'rgba(47,111,237,.10)' },   // bleu
+  B: { main:'#1ea672', bg:'rgba(30,166,114,.10)' },   // vert
+  C: { main:'#d9822b', bg:'rgba(217,130,43,.10)' },   // orange
+  D: { main:'#9b59d9', bg:'rgba(155,89,217,.10)' },   // violet
+};
+// Couleur de ligne selon le rang : 1-2 (tableau "Champions") vert,
+// 3-4 (tableau intermédiaire) jaune/neutre, 5-6 (tableau "Consolante") orange/rouge.
+// Aucun rang n'est éliminé : tous se qualifient pour la phase finale, juste sur
+// un tableau différent — la couleur indique simplement ce tableau, pas une élimination.
+function rankRowColor(rank){
+  if(rank<=2) return 'rgba(30,166,114,.12)';
+  if(rank<=4) return 'rgba(217,180,43,.10)';
+  return 'rgba(217,90,43,.10)';
+}
 function renderPoolStandingsPanel(){
   const el=document.getElementById('poolStandingsPanel'); if(!el) return;
   el.innerHTML = `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:10px">` +
     ['A','B','C','D'].map(p=>{
       const st=computePoolStandings(p);
-      return `<div style="background:var(--s1);border:1px solid var(--bdr);border-radius:8px;padding:8px 10px;overflow-x:auto">
-        <div style="font-family:'Oswald',sans-serif;font-size:13px;color:var(--blu);margin-bottom:4px">Poule ${p}</div>
+      const col = POOL_COLORS[p];
+      return `<div style="background:var(--s1);border:1px solid ${col.main};border-radius:8px;padding:8px 10px;overflow-x:auto">
+        <div style="font-family:'Oswald',sans-serif;font-size:13px;color:${col.main};margin-bottom:4px;font-weight:700">Poule ${p}</div>
         <table style="width:100%;font-size:11px;border-collapse:collapse;white-space:nowrap">
-          <thead><tr style="color:var(--dim);font-size:9px">
-            <th style="text-align:left">#</th><th style="text-align:left">Équipe</th>
-            <th>Pts</th><th>MJ</th><th>V</th><th>N</th><th>P</th><th>Bp</th><th>Bc</th><th>+/-</th>
+          <thead><tr style="color:#fff;font-size:9px;background:${col.main}">
+            <th style="text-align:left;padding:4px 6px">#</th><th style="text-align:left;padding:4px 6px">Équipe</th>
+            <th style="padding:4px 6px">Pts</th><th style="padding:4px 6px">MJ</th><th style="padding:4px 6px">V</th><th style="padding:4px 6px">N</th><th style="padding:4px 6px">P</th><th style="padding:4px 6px">Bp</th><th style="padding:4px 6px">Bc</th><th style="padding:4px 6px">+/-</th>
           </tr></thead>
-          <tbody>${st.map((s,i)=>`<tr style="border-top:1px solid var(--bdr)">
-            <td>${i+1}</td><td>${tName(s.id)}</td>
+          <tbody>${st.map((s,i)=>`<tr style="border-top:1px solid var(--bdr);background:${rankRowColor(i+1)}">
+            <td style="padding:3px 6px;font-weight:700">${i+1}</td><td style="padding:3px 6px">${tName(s.id)}</td>
             <td style="text-align:center;font-weight:700">${s.pts}</td>
             <td style="text-align:center">${s.j}</td>
             <td style="text-align:center">${s.g}</td>
@@ -1469,7 +1612,12 @@ function renderPoolStandingsPanel(){
           </tr>`).join('')}</tbody>
         </table>
       </div>`;
-    }).join('') + `</div>`;
+    }).join('') + `</div>
+    <div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;font-size:10px;color:var(--muted)">
+      <span><span style="display:inline-block;width:10px;height:10px;background:rgba(30,166,114,.5);border-radius:2px;margin-right:3px"></span>Tableau 1-2 (haut de tableau)</span>
+      <span><span style="display:inline-block;width:10px;height:10px;background:rgba(217,180,43,.5);border-radius:2px;margin-right:3px"></span>Tableau 3-4</span>
+      <span><span style="display:inline-block;width:10px;height:10px;background:rgba(217,90,43,.5);border-radius:2px;margin-right:3px"></span>Tableau 5-6</span>
+    </div>`;
 }
 
 // ── Vue Phase finale (bracket) ───────────────────────────
@@ -1494,13 +1642,21 @@ function renderBracketView(){
     if(!matches.length){
       listEl.innerHTML='<div class="info info-y">Phase finale non générée.</div>';
     } else {
-      listEl.innerHTML = matches.map(b=>{
+      let html = matches.map(b=>{
         const a=bracketTeam(b.m,'a'), bb=bracketTeam(b.m,'b');
         const r=getBracketResult(b.m);
         const label = b.label || bracketLabel(b.m);
-        const needsShootout = r.ga!==''&&r.gb!==''&&(+r.ga===+r.gb)&&!r.forfeit;
-        return matchCardHTML('bracket', b.m, a, bb, r, `${label} · T${b.court} · ${b.time}`, needsShootout);
+        const needsShootout = r.ga!==''&&r.gb!==''&&(+r.ga===+r.gb);
+        return matchCardHTML('bracket', b.m, a, bb, r, label, b.court, b.time, needsShootout);
       }).join('');
+      const tabSlot = (ST.bracketTabSlots||[]).find(t=>t.round===ST.activeBracketRound);
+      if(tabSlot){
+        html += `<div style="background:var(--ylw-bg);border:1px dashed var(--ylw);border-radius:8px;padding:10px 14px;margin-top:4px">
+          <div style="font-family:'Oswald',sans-serif;font-size:22px;font-weight:700;color:var(--ylw);margin-bottom:2px">🕐 ${tabSlot.time}</div>
+          <div style="font-size:12px">⚽ Créneau réservé — <strong>T.A.B.</strong> pour les matchs de ce tour terminés à égalité (désigne le vainqueur uniquement)</div>
+        </div>`;
+      }
+      listEl.innerHTML = html;
     }
   }
 }
@@ -1508,7 +1664,7 @@ window.setBracketRound = function(r){ ST.activeBracketRound=r; renderBracketView
 
 // ── Carte de match (saisie score) ────────────────────────
 const _scoreDebounce = {}; // { 'type_matchId': timeoutId }
-function matchCardHTML(type, matchId, aId, bId, r, subtitle, needsShootout){
+function matchCardHTML(type, matchId, aId, bId, r, subtitle, court, time, needsShootout){
   const aName = aId?tName(aId):'<em>à déterminer</em>';
   const bName = bId?tName(bId):'<em>à déterminer</em>';
   const canEdit = isScorer() && aId && bId;
@@ -1519,21 +1675,24 @@ function matchCardHTML(type, matchId, aId, bId, r, subtitle, needsShootout){
     shootoutHTML = `<div style="margin-top:6px;padding:6px 10px;background:var(--ylw-bg);border-radius:6px;font-size:11px">
       ⚽ <strong>Égalité — Tirs au but requis</strong> <span style="color:var(--muted)">(ne compte pas au classement, désigne juste le vainqueur)</span>
       ${canEdit?`<div style="display:flex;gap:6px;align-items:center;margin-top:4px">
-        <input type="number" min="0" max="20" value="${so.ga??''}" style="width:50px" id="so_a_${matchId}" title="Tirs au but équipe A" aria-label="Tirs au but équipe A" oninput="scheduleAutoSaveShootout('${type}',${matchId})">
+        <input type="number" min="0" max="20" value="${so.ga??''}" style="width:50px" id="so_a_${matchId}" title="Tirs au but équipe A" aria-label="Tirs au but équipe A" onfocus="this.select()" oninput="scheduleAutoSaveShootout('${type}',${matchId})">
         <span>–</span>
-        <input type="number" min="0" max="20" value="${so.gb??''}" style="width:50px" id="so_b_${matchId}" title="Tirs au but équipe B" aria-label="Tirs au but équipe B" oninput="scheduleAutoSaveShootout('${type}',${matchId})">
+        <input type="number" min="0" max="20" value="${so.gb??''}" style="width:50px" id="so_b_${matchId}" title="Tirs au but équipe B" aria-label="Tirs au but équipe B" onfocus="this.select()" oninput="scheduleAutoSaveShootout('${type}',${matchId})">
         <span id="so_status_${matchId}" style="font-size:10px;color:var(--muted)"></span>
       </div>`:(so.ga!=null?`<strong>${so.ga} – ${so.gb}</strong> T.A.B.`:'En attente de saisie')}
     </div>`;
   }
   return `<div style="background:var(--s1);border:1px solid var(--bdr);border-radius:10px;padding:12px 14px;margin-bottom:8px">
-    <div style="font-size:11px;color:var(--dim);margin-bottom:6px">${subtitle}</div>
+    <div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:6px">
+      <div style="font-size:11px;color:var(--dim)">${subtitle}${court?` · T${court}`:''}</div>
+      ${time?`<div style="font-family:'Oswald',sans-serif;font-size:20px;font-weight:700;color:var(--blu)">🕐 ${time}</div>`:''}
+    </div>
     <div style="display:flex;align-items:center;gap:10px">
       <div style="flex:1;font-weight:700">${aName}</div>
       ${canEdit ? `
-        <input type="number" min="0" max="50" value="${r.ga}" style="width:50px;text-align:center" id="sc_a_${type}_${matchId}" title="Score équipe A" aria-label="Score équipe A" oninput="scheduleAutoSaveScore('${type}',${matchId})">
+        <input type="number" min="0" max="50" value="${r.ga}" style="width:50px;text-align:center" id="sc_a_${type}_${matchId}" title="Score équipe A" aria-label="Score équipe A" onfocus="this.select()" oninput="scheduleAutoSaveScore('${type}',${matchId})">
         <span>–</span>
-        <input type="number" min="0" max="50" value="${r.gb}" style="width:50px;text-align:center" id="sc_b_${type}_${matchId}" title="Score équipe B" aria-label="Score équipe B" oninput="scheduleAutoSaveScore('${type}',${matchId})">
+        <input type="number" min="0" max="50" value="${r.gb}" style="width:50px;text-align:center" id="sc_b_${type}_${matchId}" title="Score équipe B" aria-label="Score équipe B" onfocus="this.select()" oninput="scheduleAutoSaveScore('${type}',${matchId})">
       ` : `<div style="font-family:'Oswald',sans-serif;font-size:18px">${done?`${r.ga} – ${r.gb}`:'–'}</div>`}
       <div style="flex:1;text-align:right;font-weight:700">${bName}</div>
     </div>
@@ -1554,8 +1713,8 @@ window.scheduleAutoSaveScore = function(type, matchId){
     if(!aEl||!bEl) return;
     const ga=aEl.value, gb=bEl.value;
     if(ga===''||gb===''){ if(statusEl) statusEl.textContent=''; return; }
-    if(type==='pool') await setPoolResult(matchId, +ga, +gb, null);
-    else await setBracketResult(matchId, +ga, +gb, null, null);
+    if(type==='pool') await setPoolResult(matchId, +ga, +gb);
+    else await setBracketResult(matchId, +ga, +gb, null);
     if(statusEl) statusEl.textContent='✓ Enregistré';
     refreshCurrentPage();
   }, 800);
@@ -1573,7 +1732,7 @@ window.scheduleAutoSaveShootout = function(type, matchId){
     if(ga===''||gb===''){ if(statusEl) statusEl.textContent=''; return; }
     if(+ga===+gb){ if(statusEl){ statusEl.textContent='⚠ Il faut un vainqueur (scores différents)'; statusEl.style.color='var(--red)'; } return; }
     const r = getBracketResult(matchId);
-    await setBracketResult(matchId, r.ga, r.gb, null, { ga:+ga, gb:+gb });
+    await setBracketResult(matchId, r.ga, r.gb, { ga:+ga, gb:+gb });
     if(statusEl){ statusEl.style.color='var(--muted)'; statusEl.textContent='✓ Enregistré'; }
     refreshCurrentPage();
   }, 800);
@@ -2192,25 +2351,16 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
   </div>
 
   <div class="card" style="margin-top:14px">
-    <div class="card-ttl">🍽️ Coupure déjeuner</div>
-    <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--s2);border-radius:8px;border:1px solid var(--bdr);margin-bottom:10px">
-      <input type="checkbox" id="cfg_lunch" checked oninput="onCfgChange()" style="width:18px;height:18px;cursor:pointer">
-      <label for="cfg_lunch" style="margin:0;text-transform:none;font-size:14px;cursor:pointer;letter-spacing:0;color:var(--ink)">Activer la coupure déjeuner (placée entre phase de poules et phase finale)</label>
+    <div class="card-ttl">☕ Coupures (déjeuner, pauses…)</div>
+    <div class="info info-b" style="font-size:12px;margin-bottom:10px">
+      Vous pouvez prévoir plusieurs coupures dans la journée. Chacune démarre juste après le créneau de matchs en cours le plus proche de l'heure indiquée (jamais en plein milieu d'un créneau), que ce soit pendant la phase de poules ou la phase finale.
     </div>
-    <div class="fr" id="lunchRow">
-      <div>
-        <label>Début du déjeuner</label>
-        <input type="time" id="cfg_lunchstart" value="12:00" title="Heure de début du déjeuner" aria-label="Heure de début du déjeuner" oninput="onCfgChange()">
-      </div>
-      <div>
-        <label>Durée déjeuner (min)</label>
-        <input type="number" id="cfg_lunchdur" value="45" min="15" max="180" step="15" title="Durée du déjeuner en minutes" aria-label="Durée du déjeuner" oninput="onCfgChange()">
-      </div>
-    </div>
+    <div id="breaksList"></div>
+    <button class="btn btn-ghost btn-sm mt8" onclick="addBreakRow()">➕ Ajouter une coupure</button>
   </div>
 
   <div class="card" style="margin-top:14px">
-    <div class="card-ttl">🎲 Tirage des poules & Forfaits</div>
+    <div class="card-ttl">🎲 Tirage des poules</div>
     <div class="fg">
       <div class="fr">
         <div>
@@ -2219,13 +2369,6 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
             <option value="order">📋 Ordre d'inscription</option>
             <option value="random">🎲 Aléatoire</option>
             <option value="random-no-club">🎲 Aléatoire (évite même club/poule)</option>
-          </select>
-        </div>
-        <div>
-          <label>Score vainqueur en cas de forfait</label>
-          <select id="cfg_forfeit" oninput="onCfgChange()" title="Score vainqueur en cas de forfait" aria-label="Score vainqueur en cas de forfait">
-            <option value="3">3 - 0</option>
-            <option value="5">5 - 0</option>
           </select>
         </div>
       </div>
