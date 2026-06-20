@@ -30,13 +30,12 @@ import { getFirestore, doc, getDoc, getDocs, setDoc, deleteDoc, onSnapshot, coll
                                     from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
 
 const firebaseConfig = {
-  apiKey: "AIzaSyCjyPfCjKvSVFUp8dyF0bjbXwuDIukGu2c",
-  authDomain: "tournoi-foot-inter-entreprises.firebaseapp.com",
-  projectId: "tournoi-foot-inter-entreprises",
-  storageBucket: "tournoi-foot-inter-entreprises.firebasestorage.app",
-  messagingSenderId: "995068678625",
-  appId: "1:995068678625:web:cbe198e586f4e928f802a0",
-  measurementId: "G-D6ZFZR3XJN"
+  apiKey: "AIzaSyAa-It1GI_9KTAvQKzkLWNANv91QnZar04",
+  authDomain: "tournoi-foot-entreprises.firebaseapp.com",
+  projectId: "tournoi-foot-entreprises",
+  storageBucket: "tournoi-foot-entreprises.firebasestorage.app",
+  messagingSenderId: "894506578702",
+  appId: "1:894506578702:web:0000000000000000000000"
 };
 // ⚠️ Remplacez les valeurs ci-dessus par celles de VOTRE projet Firebase
 // (créez un nouveau projet Firebase dédié à ce tournoi de foot, distinct du pickleball)
@@ -52,7 +51,9 @@ const gProvider = new GoogleAuthProvider();
 // ══════════════════════════════════════════════════════════
 let CURRENT_USER = null;
 let USER_ROLE    = null;
+let MANAGER_TEAM_ID = null; // équipe assignée si USER_ROLE === 'manager'
 let unsubTournament = null;
+let unsubRoster = null;
 
 const ST = {
   page:1, prevPage:1, rulesOpen:false,
@@ -85,6 +86,7 @@ const ST = {
 
 function isAdmin()  { return USER_ROLE === 'admin'; }
 function isScorer() { return USER_ROLE === 'admin' || USER_ROLE === 'scorer'; }
+function isManager(){ return USER_ROLE === 'manager'; }
 function isLiveBlocked(){ return USER_ROLE === 'spectator' && !ST.liveOpen; }
 
 function addMinutes(timeStr, mins){
@@ -161,15 +163,18 @@ function bracketLabel(m){
 // ══════════════════════════════════════════════════════════
 // AUTH
 // ══════════════════════════════════════════════════════════
-async function getUserRole(uid){
+async function getUserProfile(uid){
   try {
     const snap = await getDoc(doc(db,'users',uid));
-    if(snap.exists()) return snap.data().role || 'spectator';
-    return 'spectator'; // doc inexistant = nouvel utilisateur, rôle par défaut
+    if(snap.exists()){
+      const d = snap.data();
+      return { role: d.role || 'spectator', teamId: d.teamId || null };
+    }
+    return { role:'spectator', teamId:null }; // doc inexistant = nouvel utilisateur, rôle par défaut
   } catch(e){
-    console.error('getUserRole: échec de lecture du profil — rôle dégradé en spectateur par sécurité.', e);
+    console.error('getUserProfile: échec de lecture du profil — rôle dégradé en spectateur par sécurité.', e);
     showAuthMsg('⚠️ Impossible de vérifier vos droits (problème réseau ou permissions). Reconnectez-vous.', 'red');
-    return 'spectator';
+    return { role:'spectator', teamId:null };
   }
 }
 async function ensureUserDoc(user){
@@ -194,7 +199,9 @@ onAuthStateChanged(auth, async (user)=>{
   if(user){
     CURRENT_USER = user;
     await ensureUserDoc(user);
-    USER_ROLE = await getUserRole(user.uid);
+    const profile = await getUserProfile(user.uid);
+    USER_ROLE = profile.role;
+    MANAGER_TEAM_ID = profile.teamId;
     if(USER_ROLE === 'spectator'){
       try {
         const snap = await getDoc(doc(db,'foottournoi','current'));
@@ -202,7 +209,7 @@ onAuthStateChanged(auth, async (user)=>{
       } catch(e){ ST.liveOpen = false; }
       if(!ST.liveOpen){
         await signOut(auth);
-        CURRENT_USER = null; USER_ROLE = null;
+        CURRENT_USER = null; USER_ROLE = null; MANAGER_TEAM_ID = null;
         showLogin();
         showAuthMsg('⏰ Le live n\'est pas encore ouvert.', 'red');
         return;
@@ -210,8 +217,9 @@ onAuthStateChanged(auth, async (user)=>{
     }
     showApp();
     subscribeToTournament();
+    if(USER_ROLE === 'manager' && MANAGER_TEAM_ID) subscribeToRoster(MANAGER_TEAM_ID);
   } else {
-    CURRENT_USER = null; USER_ROLE = null;
+    CURRENT_USER = null; USER_ROLE = null; MANAGER_TEAM_ID = null;
     unsubAll();
     try {
       const snap = await getDoc(doc(db,'foottournoi','current'));
@@ -223,6 +231,7 @@ onAuthStateChanged(auth, async (user)=>{
 
 function unsubAll(){
   if(unsubTournament){ unsubTournament(); unsubTournament=null; }
+  if(unsubRoster){ unsubRoster(); unsubRoster=null; }
 }
 
 window.loginEmail = async function(){
@@ -307,6 +316,54 @@ function refreshCurrentPage(){
   if(ST.page===4) renderTournamentPage();
   if(ST.page===5) renderFinalPage();
   if(ST.page==='T') renderTeamsSpecPage();
+  if(ST.page==='M') renderManagerPage();
+}
+
+// ══════════════════════════════════════════════════════════
+// FEUILLES D'ÉQUIPE (ROSTERS) — sous-collection 'teamRosters/{teamId}'
+// Gérée par le responsable d'équipe (manager) pour SA propre équipe,
+// ou par l'admin pour n'importe quelle équipe (vue/édition libre).
+// Structure : { players:[{nom,prenom,licence}], updatedAt }
+// ══════════════════════════════════════════════════════════
+const ROSTERS = {}; // cache local { teamId: {players:[...]} }
+const MAX_PLAYERS = 10;
+
+function subscribeToRoster(teamId){
+  if(unsubRoster){ unsubRoster(); unsubRoster=null; }
+  if(!teamId) return;
+  unsubRoster = onSnapshot(doc(db,'teamRosters',teamId), (snap)=>{
+    ROSTERS[teamId] = snap.exists() ? snap.data() : { players: [] };
+    if(ST.page==='M') renderManagerPage();
+  }, (e)=>{ console.error('subscribeToRoster', e); });
+}
+
+async function getRosterOnce(teamId){
+  if(ROSTERS[teamId]) return ROSTERS[teamId];
+  try {
+    const snap = await getDoc(doc(db,'teamRosters',teamId));
+    const data = snap.exists() ? snap.data() : { players: [] };
+    ROSTERS[teamId] = data;
+    return data;
+  } catch(e){
+    console.error('getRosterOnce', e);
+    return { players: [] };
+  }
+}
+
+function emptyPlayer(){ return { nom:'', prenom:'', licence:'' }; }
+
+// Sauvegarde la liste des joueurs d'une équipe. Autorisé pour l'admin/scorer
+// (n'importe quelle équipe) ou pour le manager assigné (sa propre équipe seulement,
+// imposé aussi côté règles Firestore).
+async function saveRoster(teamId, players){
+  if(!isAdmin() && !isScorer() && !(isManager() && MANAGER_TEAM_ID===teamId)) return;
+  try {
+    await setDoc(doc(db,'teamRosters',teamId), { players, updatedAt: serverTimestamp() }, { merge:true });
+    ROSTERS[teamId] = { players };
+  } catch(e){
+    console.error('saveRoster', e);
+    alert('Erreur de sauvegarde de la feuille d\'équipe : '+e.message);
+  }
 }
 
 // ══════════════════════════════════════════════════════════
@@ -637,9 +694,10 @@ function showApp(){
   document.getElementById('loginScreen').style.display='none';
   document.getElementById('appScreen').style.display='block';
   applyRoleUI();
+  if(USER_ROLE === 'manager') goTo('M');
 }
 function roleBadge(role){
-  const map={admin:'👑 Admin',scorer:'✏️ Scorer (saisie scores)',spectator:'👁 Spectateur'};
+  const map={admin:'👑 Admin',scorer:'✏️ Scorer (saisie scores)',manager:'🛡️ Responsable équipe',spectator:'👁 Spectateur'};
   return map[role]||role;
 }
 
@@ -653,15 +711,14 @@ function applyRoleUI(){
   if(hdrName) hdrName.textContent = name + ' · ' + roleBadge(USER_ROLE);
   const lBtn = document.getElementById('logoutBtn');
   if(lBtn) lBtn.textContent = CURRENT_USER ? 'Déconnexion' : 'Quitter';
-  const refreshBtn = document.getElementById('refreshRoleBtn');
-  if(refreshBtn) refreshBtn.style.display = CURRENT_USER ? '' : 'none';
   const isSpec = USER_ROLE === 'spectator';
   const specNav = document.getElementById('specNav');
   if(specNav) specNav.classList.toggle('visible', isSpec);
   const stepNav = document.getElementById('stepNav');
-  if(stepNav) stepNav.style.display = isSpec ? 'none' : '';
+  if(stepNav) stepNav.style.display = (isSpec || isManager()) ? 'none' : '';
   document.querySelectorAll('[data-role="admin"]').forEach(el=>{ el.style.display = isAdmin() ? '' : 'none'; });
   document.querySelectorAll('[data-role="scorer"]').forEach(el=>{ el.style.display = isScorer() ? '' : 'none'; });
+  document.querySelectorAll('[data-role="manager"]').forEach(el=>{ el.style.display = isManager() ? '' : 'none'; });
   updateStepVisibility();
   updateFwdBtn();
   updateBackFwdLabels();
@@ -725,6 +782,12 @@ window.goTo = function(n){
       btn.classList.toggle('spec-nav-active', btn.textContent.includes('ÉQUIPES'));
     });
     ST.page='T';
+    return;
+  }
+  if(n==='M'){
+    document.getElementById('pageM').classList.add('active');
+    renderManagerPage();
+    ST.page='M';
     return;
   }
   document.getElementById('page'+n).classList.add('active');
@@ -802,8 +865,20 @@ window.toggleUsersPanel = function(){
   if(!p) return;
   const show = p.style.display==='none';
   p.style.display = show ? '' : 'none';
-  if(show) loadUsersList();
+  if(show){
+    loadUsersList();
+    populateNewStaffTeamSelect();
+  }
 };
+
+function populateNewStaffTeamSelect(){
+  const sel=document.getElementById('newStaffTeamId'); if(!sel) return;
+  const limit=ST.cfg.n||ST.teams.length;
+  const teams=ST.teams.slice(0,limit);
+  sel.innerHTML = teams.length
+    ? teams.map(t=>`<option value="${t.id}">${t.name}</option>`).join('')
+    : `<option value="">— Aucune équipe créée —</option>`;
+}
 
 window.loadUsersList = async function(){
   if(!isAdmin()) return;
@@ -824,30 +899,72 @@ window.loadUsersList = async function(){
 function renderUsersList(users){
   const el=document.getElementById('usersList'); if(!el) return;
   if(!users.length){ el.innerHTML='<div class="info info-y" style="font-size:12px">Aucun compte enregistré pour le moment (les comptes apparaissent ici après leur 1ère connexion).</div>'; return; }
-  const roleColor = r => r==='admin' ? 'var(--red)' : r==='scorer' ? 'var(--blu)' : 'var(--muted)';
+  const roleColor = r => r==='admin' ? 'var(--red)' : r==='scorer' ? 'var(--blu)' : r==='manager' ? 'var(--ylw)' : 'var(--muted)';
+  const limit=ST.cfg.n||ST.teams.length;
+  const teams=ST.teams.slice(0,limit);
   el.innerHTML = users.map(u=>`
     <div style="display:flex;align-items:center;gap:10px;padding:8px 10px;border-bottom:1px solid var(--bdr);font-size:13px;flex-wrap:wrap">
       <div style="flex:1;min-width:160px">
         <div style="font-weight:700;color:var(--ink)">${u.name||u.email||u.id}</div>
-        <div style="font-size:11px;color:var(--muted)">${u.email||'—'}</div>
+        <div style="font-size:11px;color:var(--muted)">${u.email||'—'}${u.role==='manager'&&u.teamId?' · '+tName(u.teamId):''}</div>
       </div>
       <span style="font-size:11px;font-weight:700;color:${roleColor(u.role)};text-transform:uppercase;letter-spacing:.5px;min-width:90px">${u.role||'spectator'}</span>
       <select onchange="changeUserRole('${u.id}', this.value)" style="width:auto;min-width:140px" title="Changer le rôle de ${u.email||u.id}">
         <option value="spectator" ${u.role==='spectator'||!u.role?'selected':''}>👁 Spectateur</option>
         <option value="scorer" ${u.role==='scorer'?'selected':''}>✏️ Scorer (saisie scores)</option>
+        <option value="manager" ${u.role==='manager'?'selected':''}>🛡️ Responsable d'équipe</option>
         <option value="admin" ${u.role==='admin'?'selected':''}>👑 Admin</option>
       </select>
+      ${u.role==='manager' ? `<select onchange="changeUserTeam('${u.id}', this.value)" style="width:auto;min-width:140px" title="Changer l'équipe gérée">
+        ${teams.map(t=>`<option value="${t.id}" ${t.id===u.teamId?'selected':''}>${t.name}</option>`).join('')}
+      </select>` : ''}
+      <button class="btn btn-ghost btn-xs" style="color:var(--red);border-color:var(--red)" onclick="deleteStaffAccount('${u.id}','${(u.name||u.email||u.id).replace(/'/g,"\\'")}')" title="Supprimer ce compte">🗑 Supprimer</button>
     </div>`).join('');
 }
 
 window.changeUserRole = async function(userId, newRole){
   if(!isAdmin()) return;
   try {
-    await updateDoc(doc(db,'users',userId), { role: newRole });
+    const patch = { role: newRole };
+    if(newRole!=='manager') patch.teamId = null;
+    await updateDoc(doc(db,'users',userId), patch);
     loadUsersList();
   } catch(e){
     console.error('changeUserRole', e);
     alert('Erreur lors du changement de rôle : '+e.message);
+  }
+};
+
+window.changeUserTeam = async function(userId, teamId){
+  if(!isAdmin()) return;
+  try {
+    await updateDoc(doc(db,'users',userId), { teamId });
+    loadUsersList();
+  } catch(e){
+    console.error('changeUserTeam', e);
+    alert('Erreur lors du changement d\'équipe : '+e.message);
+  }
+};
+
+// Supprime la fiche Firestore d'un compte (admin/scorer/spectator).
+// ⚠️ Limite technique : ceci supprime uniquement le document Firestore 'users/{uid}',
+// pas le compte Firebase Authentication lui-même (impossible depuis le client pour
+// un AUTRE utilisateur — il faudrait une Cloud Function avec l'Admin SDK).
+// Effet concret : la personne perd immédiatement tous ses droits (repasse 'spectator'
+// par défaut au prochain chargement), mais peut en théorie se reconnecter avec son
+// ancien email/mot de passe — elle obtiendra alors automatiquement une nouvelle fiche
+// 'spectator' (cf. ensureUserDoc). Si vous voulez l'empêcher de se reconnecter du tout,
+// il faut désactiver/supprimer son compte dans la console Firebase (Authentication).
+window.deleteStaffAccount = async function(userId, label){
+  if(!isAdmin()) return;
+  if(CURRENT_USER && CURRENT_USER.uid===userId){ alert('Vous ne pouvez pas supprimer votre propre compte admin connecté.'); return; }
+  if(!confirm(`Supprimer le compte de "${label}" ?\n\nCette personne perdra immédiatement ses droits (admin/scorer). Elle pourra théoriquement se reconnecter en tant que spectateur avec son ancien mot de passe — pour bloquer totalement l'accès, supprimez aussi son compte dans la console Firebase (Authentication).`)) return;
+  try {
+    await deleteDoc(doc(db,'users',userId));
+    loadUsersList();
+  } catch(e){
+    console.error('deleteStaffAccount', e);
+    alert('Erreur lors de la suppression : '+e.message);
   }
 };
 
@@ -861,12 +978,14 @@ window.createStaffAccount = async function(){
   const email     = document.getElementById('newStaffEmail').value.trim();
   const pwd       = document.getElementById('newStaffPwd').value;
   const role      = document.getElementById('newStaffRole').value;
+  const teamId    = document.getElementById('newStaffTeamId') ? document.getElementById('newStaffTeamId').value : null;
   const adminPwd  = document.getElementById('adminPwdConfirm').value;
   const msgEl     = document.getElementById('newStaffMsg');
   const setMsg = (txt,color)=>{ if(msgEl){ msgEl.textContent=txt; msgEl.style.color = color==='red'?'var(--red)':'var(--grn)'; } };
 
   if(!name||!email||!pwd){ setMsg('Remplissez nom, email et mot de passe.','red'); return; }
   if(pwd.length<6){ setMsg('Le mot de passe doit faire au moins 6 caractères.','red'); return; }
+  if(role==='manager' && !teamId){ setMsg('Sélectionnez l\'équipe gérée par ce responsable.','red'); return; }
   if(!adminPwd){ setMsg('Indiquez votre propre mot de passe admin pour la reconnexion automatique.','red'); return; }
 
   const adminEmail = CURRENT_USER ? CURRENT_USER.email : null;
@@ -879,15 +998,15 @@ window.createStaffAccount = async function(){
     const newUid = cred.user.uid;
     await updateProfile(cred.user, { displayName: name });
 
-    // 2. Crée la fiche Firestore avec le rôle choisi
-    await setDoc(doc(db,'users',newUid), {
-      email, name, role, createdAt: serverTimestamp(), createdBy: adminEmail
-    });
+    // 2. Crée la fiche Firestore avec le rôle choisi (+ teamId si manager)
+    const userDoc = { email, name, role, createdAt: serverTimestamp(), createdBy: adminEmail };
+    if(role==='manager') userDoc.teamId = teamId;
+    await setDoc(doc(db,'users',newUid), userDoc);
 
     // 3. Reconnecte l'admin avec son propre mot de passe
     await signInWithEmailAndPassword(auth, adminEmail, adminPwd);
 
-    setMsg(`✓ Compte staff créé pour ${name} (${roleBadge(role)}). Vous êtes reconnecté en admin.`,'grn');
+    setMsg(`✓ Compte staff créé pour ${name} (${roleBadge(role)}${role==='manager'?' — '+tName(teamId):''}). Vous êtes reconnecté en admin.`,'grn');
     document.getElementById('newStaffName').value='';
     document.getElementById('newStaffEmail').value='';
     document.getElementById('newStaffPwd').value='';
@@ -900,23 +1019,6 @@ window.createStaffAccount = async function(){
     if(auth.currentUser && auth.currentUser.email !== adminEmail){
       setMsg('Compte staff créé, mais la reconnexion admin a échoué (mot de passe admin incorrect ?). Reconnectez-vous manuellement.','red');
     }
-  }
-};
-
-// Permet à un utilisateur déjà connecté de rafraîchir son propre rôle
-// sans avoir à se déconnecter/reconnecter (utile juste après qu'un admin
-// l'ait promu scorer/admin).
-window.refreshMyRole = async function(){
-  if(!CURRENT_USER) return;
-  const oldRole = USER_ROLE;
-  const newRole = await getUserRole(CURRENT_USER.uid);
-  if(newRole !== oldRole){
-    USER_ROLE = newRole;
-    applyRoleUI();
-    refreshCurrentPage();
-    alert(`✓ Rôle mis à jour : ${roleBadge(USER_ROLE)}`);
-  } else {
-    alert('Aucun changement de rôle détecté pour votre compte.');
   }
 };
 
@@ -936,7 +1038,7 @@ window.closeMobileMenu = function(){
   document.getElementById('menuOverlay').classList.remove('open');
 };
 function syncDrawerButtons(){
-  [['liveBtn','drawerLiveBtn'],['adminBtn','drawerAdminBtn'],['backBtn','drawerBackBtn'],['fwdBtn','drawerFwdBtn'],['refreshRoleBtn','drawerRefreshRoleBtn'],['logoutBtn','drawerLogoutBtn']].forEach(([deskId,drawId])=>{
+  [['liveBtn','drawerLiveBtn'],['adminBtn','drawerAdminBtn'],['managerBtn','drawerManagerBtn'],['backBtn','drawerBackBtn'],['fwdBtn','drawerFwdBtn'],['logoutBtn','drawerLogoutBtn']].forEach(([deskId,drawId])=>{
     const desk=document.getElementById(deskId); const draw=document.getElementById(drawId);
     if(desk&&draw) draw.style.display=desk.style.display==='none'?'none':'';
   });
@@ -1063,6 +1165,11 @@ window.addTeam = async function(){
   const id = 't_'+Date.now()+'_'+Math.random().toString(36).slice(2,6);
   ST.teams.push({ id, name, club, lv });
   await saveTournament({ teams: ST.teams });
+  // Crée le doc teamRosters vide associé : nécessaire pour que le futur responsable
+  // d'équipe (manager) puisse ensuite faire un update (et non un create, qui lui
+  // est interdit par les règles Firestore) lors de sa 1ère sauvegarde de joueurs.
+  try { await setDoc(doc(db,'teamRosters',id), { players: [], updatedAt: serverTimestamp() }); }
+  catch(e){ console.warn('Création teamRosters initiale échouée (non bloquant)', e); }
   ['t_name','t_club'].forEach(fid=>{ const el=document.getElementById(fid); if(el) el.value=''; });
   renderTeamsPage();
 };
@@ -1093,6 +1200,9 @@ window.autoFillTeams = async function(){
     ST.teams.push({ id:'t_auto_'+i, name: ent, club: ent, lv: (i%5)+1 });
   }
   await saveTournament({ teams: ST.teams });
+  // Crée les docs teamRosters vides associés (cf. note dans addTeam()).
+  try { await Promise.all(ST.teams.map(t=>setDoc(doc(db,'teamRosters',t.id), { players: [], updatedAt: serverTimestamp() }))); }
+  catch(e){ console.warn('Création teamRosters en lot échouée (non bloquant)', e); }
   renderTeamsPage();
 };
 
@@ -1552,8 +1662,97 @@ function renderTeamsSpecPage(){
 }
 
 // ══════════════════════════════════════════════════════════
-// TIMER (chrono match) — durée selon la phase active (poules/finale)
+// PAGE RESPONSABLE D'ÉQUIPE — inscription des 10 joueurs
+// (manager : sa propre équipe / admin : équipe au choix pour vérif/correction)
 // ══════════════════════════════════════════════════════════
+let ADMIN_VIEW_TEAM_ID = null; // équipe choisie par l'admin pour consulter/éditer
+
+function currentRosterTeamId(){
+  return isManager() ? MANAGER_TEAM_ID : ADMIN_VIEW_TEAM_ID;
+}
+
+window.adminPickRosterTeam = function(teamId){
+  if(!isAdmin()) return;
+  ADMIN_VIEW_TEAM_ID = teamId || null;
+  if(ADMIN_VIEW_TEAM_ID){ getRosterOnce(ADMIN_VIEW_TEAM_ID).then(renderManagerPage); }
+  else renderManagerPage();
+};
+
+async function renderManagerPage(){
+  const el=document.getElementById('managerPageBody'); if(!el) return;
+  const teamId = currentRosterTeamId();
+
+  if(isAdmin()){
+    const pickerEl=document.getElementById('managerTeamPicker');
+    if(pickerEl){
+      const limit=ST.cfg.n||ST.teams.length;
+      const teams=ST.teams.slice(0,limit);
+      pickerEl.style.display='';
+      pickerEl.innerHTML = `<label style="font-size:12px;color:var(--muted)">Choisir une équipe à consulter/modifier :</label>
+        <select onchange="adminPickRosterTeam(this.value)" style="margin-top:4px">
+          <option value="">— Sélectionner une équipe —</option>
+          ${teams.map(t=>`<option value="${t.id}" ${t.id===ADMIN_VIEW_TEAM_ID?'selected':''}>${t.name}</option>`).join('')}
+        </select>`;
+    }
+  } else {
+    const pickerEl=document.getElementById('managerTeamPicker');
+    if(pickerEl) pickerEl.style.display='none';
+  }
+
+  if(!teamId){
+    el.innerHTML = isAdmin()
+      ? '<div class="info info-b">Sélectionnez une équipe ci-dessus pour voir/modifier sa feuille de joueurs.</div>'
+      : '<div class="info info-r">Aucune équipe ne vous est assignée. Contactez l\'organisation.</div>';
+    return;
+  }
+
+  const team = tObj(teamId);
+  const roster = await getRosterOnce(teamId);
+  const players = (roster.players && roster.players.length) ? roster.players : [];
+  // On affiche toujours MAX_PLAYERS lignes (vides si besoin) pour saisie facile.
+  const rows = [];
+  for(let i=0;i<MAX_PLAYERS;i++) rows.push(players[i] || emptyPlayer());
+
+  el.innerHTML = `
+    <div class="card-ttl" style="margin-bottom:10px">
+      <span>👥 Feuille d'équipe — ${team?team.name:'Équipe inconnue'}</span>
+      <span style="font-size:11px;color:var(--muted)">${rows.filter(p=>p.nom||p.prenom||p.licence).length} / ${MAX_PLAYERS} joueurs renseignés</span>
+    </div>
+    <div id="rosterMsg" style="font-size:12px;min-height:16px;margin-bottom:6px"></div>
+    <div style="overflow-x:auto">
+    <table class="stbl" style="width:100%;min-width:480px">
+      <thead><tr><th style="text-align:left">#</th><th style="text-align:left">Nom</th><th style="text-align:left">Prénom</th><th style="text-align:left">N° licence</th></tr></thead>
+      <tbody>
+        ${rows.map((p,i)=>`<tr>
+          <td>${i+1}</td>
+          <td><input type="text" id="rost_nom_${i}" value="${(p.nom||'').replace(/"/g,'&quot;')}" placeholder="Nom" style="width:100%"></td>
+          <td><input type="text" id="rost_prenom_${i}" value="${(p.prenom||'').replace(/"/g,'&quot;')}" placeholder="Prénom" style="width:100%"></td>
+          <td><input type="text" id="rost_licence_${i}" value="${(p.licence||'').replace(/"/g,'&quot;')}" placeholder="N° licence" style="width:100%"></td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+    </div>
+    <div class="flex g8 fw mt16">
+      <button class="btn btn-g" onclick="submitRoster('${teamId}')">✓ Enregistrer la feuille d'équipe</button>
+    </div>
+  `;
+}
+
+window.submitRoster = async function(teamId){
+  const msgEl=document.getElementById('rosterMsg');
+  const setMsg=(txt,color)=>{ if(msgEl){ msgEl.textContent=txt; msgEl.style.color=color==='red'?'var(--red)':'var(--grn)'; } };
+  const players=[];
+  for(let i=0;i<MAX_PLAYERS;i++){
+    const nom=(document.getElementById(`rost_nom_${i}`)?.value||'').trim();
+    const prenom=(document.getElementById(`rost_prenom_${i}`)?.value||'').trim();
+    const licence=(document.getElementById(`rost_licence_${i}`)?.value||'').trim();
+    if(nom||prenom||licence) players.push({ nom, prenom, licence });
+  }
+  await saveRoster(teamId, players);
+  setMsg(`✓ Feuille d'équipe enregistrée (${players.length} joueur${players.length>1?'s':''}).`, 'grn');
+};
+
+
 function fmt(s){ return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0'); }
 function currentMatchDuration(){
   return ST.activeView==='bracket' ? (ST.cfg.matchDurBracket||12) : (ST.cfg.matchDur||12);
@@ -1568,6 +1767,7 @@ function updateTimerDisplay(){
   if(ST.timerRun){ if(s===0) _playSiren(2.5,0.9); else if(s===30) _playWarn30(); else if(s>=1&&s<=5) _playCountdownBeep(s===1); }
 }
 window.startTimer = function(mode){
+  if(!isAdmin()) return;
   _unlockAudio(); clearInterval(ST.timerIv); ST.timerMode=mode;
   const secs = mode==='match' ? currentMatchDuration() : (ST.cfg.tt||4);
   ST.timerSec=secs*60; ST.timerRun=true; updateTimerDisplay();
@@ -1576,11 +1776,13 @@ window.startTimer = function(mode){
   ST.timerIv=setInterval(()=>{ if(ST.timerSec>0){ ST.timerSec--;updateTimerDisplay(); } else { clearInterval(ST.timerIv);ST.timerRun=false; const p2=document.getElementById('tmrP'); if(p2) p2.style.display='none'; } },1000);
 };
 window.pauseTimer = function(){
+  if(!isAdmin()) return;
   clearInterval(ST.timerIv);ST.timerRun=false;
   const p=document.getElementById('tmrP'), r=document.getElementById('tmrR');
   if(p) p.style.display='none'; if(r) r.style.display='';
 };
 window.resumeTimer = function(){
+  if(!isAdmin()) return;
   _unlockAudio();
   const p=document.getElementById('tmrP'), r=document.getElementById('tmrR');
   if(p) p.style.display=''; if(r) r.style.display='none';
@@ -1855,9 +2057,9 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
     <button class="hdr-btn" id="ruleBtn" onclick="toggleRules()">📋 Règlement</button>
     <button class="hdr-btn" id="liveBtn" data-role="scorer" onclick="goToLive()" style="display:none">📺 Live</button>
     <button class="hdr-btn" id="adminBtn" data-role="admin" onclick="toggleAdminPanel()" style="display:none">👑 Admin</button>
+    <button class="hdr-btn" id="managerBtn" data-role="manager" onclick="goTo('M')" style="display:none">🛡️ Mon équipe</button>
     <button class="hdr-btn" id="backBtn" style="display:none" onclick="goBack()">← Retour</button>
     <button class="hdr-btn" id="fwdBtn" style="display:none" onclick="goFwd()">Suivant →</button>
-    <button class="hdr-btn" id="refreshRoleBtn" onclick="refreshMyRole()" title="Actualiser mes droits d'accès" style="display:none">🔄 Mes droits</button>
     <button class="hdr-btn" id="logoutBtn" onclick="logout()">Quitter</button>
   </div>
   <button class="hdr-menu-btn" id="menuHamburger" onclick="toggleMobileMenu()" title="Menu" aria-label="Ouvrir le menu"><span></span><span></span><span></span></button>
@@ -1868,11 +2070,11 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
   <button class="hdr-drawer-btn" id="drawerRuleBtn" onclick="toggleRules();closeMobileMenu()">📋 Règlement</button>
   <button class="hdr-drawer-btn" id="drawerLiveBtn" data-role="scorer" onclick="goToLive()" style="display:none">📺 Live</button>
   <button class="hdr-drawer-btn" id="drawerAdminBtn" data-role="admin" onclick="toggleAdminPanel();closeMobileMenu()" style="display:none">👑 Admin</button>
+  <button class="hdr-drawer-btn" id="drawerManagerBtn" data-role="manager" onclick="goTo('M');closeMobileMenu()" style="display:none">🛡️ Mon équipe</button>
   <div class="hdr-drawer-sep"></div>
   <button class="hdr-drawer-btn" id="drawerBackBtn" onclick="goBack();closeMobileMenu()" style="display:none">← Retour</button>
   <button class="hdr-drawer-btn" id="drawerFwdBtn" onclick="goFwd();closeMobileMenu()" style="display:none">Suivant →</button>
   <div class="hdr-drawer-sep"></div>
-  <button class="hdr-drawer-btn" id="drawerRefreshRoleBtn" onclick="refreshMyRole();closeMobileMenu()" style="display:none">🔄 Actualiser mes droits</button>
   <button class="hdr-drawer-btn drawer-danger" id="drawerLogoutBtn" onclick="logout();closeMobileMenu()">Quitter</button>
 </nav>
 
@@ -1882,6 +2084,7 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
   <div class="flex g8 fw">
     <button class="btn btn-g btn-sm" id="liveToggleBtn" onclick="toggleLiveOpen()">🔴 Live fermé (spectateurs)</button>
     <button class="btn btn-b btn-sm" onclick="toggleUsersPanel()">👥 Gérer le staff</button>
+    <button class="btn btn-b btn-sm" onclick="toggleAdminPanel();goTo('M')">📋 Feuilles d'équipe</button>
     <button class="btn btn-y btn-sm" onclick="resetAllResults()">🔄 Réinitialiser tous les scores</button>
     <button class="btn btn-r btn-sm" onclick="newTournament()">🆕 Nouveau tournoi</button>
   </div>
@@ -1889,7 +2092,7 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
       <strong style="font-size:13px">👥 Comptes utilisateurs</strong>
       <button class="btn btn-ghost btn-xs" onclick="loadUsersList()">🔄 Actualiser</button>
-      <span style="font-size:11px;color:var(--muted)">Changez le rôle pour donner l'accès à la saisie des scores (scorer) ou l'accès complet (admin).</span>
+      <span style="font-size:11px;color:var(--muted)">Changez le rôle pour donner l'accès à la saisie des scores (scorer), à la feuille d'une équipe (responsable), ou l'accès complet (admin).</span>
     </div>
     <div id="usersList" style="max-height:320px;overflow-y:auto"></div>
 
@@ -1898,13 +2101,18 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
       <div id="newStaffMsg" style="font-size:12px;min-height:16px;margin:6px 0"></div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
         <input type="text" id="newStaffName" placeholder="Nom complet">
-        <select id="newStaffRole">
+        <select id="newStaffRole" onchange="document.getElementById('newStaffTeamWrap').style.display=this.value==='manager'?'':'none'">
           <option value="scorer" selected>✏️ Scorer (saisie scores)</option>
           <option value="admin">👑 Admin</option>
+          <option value="manager">🛡️ Responsable d'équipe</option>
           <option value="spectator">👁 Spectateur</option>
         </select>
         <input type="email" id="newStaffEmail" placeholder="email@exemple.com">
         <input type="password" id="newStaffPwd" placeholder="Mot de passe (min. 6 car.)">
+      </div>
+      <div id="newStaffTeamWrap" style="display:none;margin-bottom:8px">
+        <label style="font-size:11px;color:var(--muted)">Équipe gérée par ce responsable</label>
+        <select id="newStaffTeamId"></select>
       </div>
       <div style="margin-bottom:8px">
         <label style="font-size:11px;color:var(--muted)">Votre mot de passe admin (pour vous reconnecter automatiquement après création)</label>
@@ -2128,7 +2336,7 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
   <div class="sec-ttl">⚽ Tournoi en direct</div>
 
   <!-- CHRONO MATCH -->
-  <div class="timer-wrap" data-role="scorer">
+  <div class="timer-wrap" data-role="admin">
     <div>
       <div class="timer-lbl" id="tmrLbl">⏱ MATCH</div>
       <div class="timer-big tc-match" id="tmrDsp">00:00</div>
@@ -2198,6 +2406,15 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
     Cliquez sur une équipe pour afficher et imprimer son programme complet (poules + phase finale).
   </div>
   <div id="teamsSpecGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px"></div>
+</div>
+</div>
+
+<!-- ══ PAGE RESPONSABLE D'ÉQUIPE ══ -->
+<div class="page" id="pageM">
+<div class="wrap">
+  <div class="sec-ttl">🛡️ Feuille d'équipe</div>
+  <div id="managerTeamPicker" class="card" style="margin-bottom:14px;display:none"></div>
+  <div class="card" id="managerPageBody"></div>
 </div>
 </div>
 
