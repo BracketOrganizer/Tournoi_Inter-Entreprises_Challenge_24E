@@ -168,15 +168,19 @@ async function getUserRole(uid){
   return 'spectator';
 }
 async function ensureUserDoc(user){
-  const ref  = doc(db,'users',user.uid);
-  const snap = await getDoc(ref);
-  if(!snap.exists()){
-    await setDoc(ref,{
-      email: user.email,
-      name:  user.displayName || user.email.split('@')[0],
-      role:  'spectator',
-      createdAt: serverTimestamp()
-    });
+  const ref = doc(db,'users',user.uid);
+  try {
+    const snap = await getDoc(ref);
+    if(!snap.exists()){
+      await setDoc(ref,{
+        email: user.email,
+        name:  user.displayName || user.email.split('@')[0],
+        role:  'spectator',
+        createdAt: serverTimestamp()
+      });
+    }
+  } catch(e){
+    console.warn('ensureUserDoc: connexion Firestore indisponible, nouvelle tentative au prochain chargement.', e);
   }
 }
 
