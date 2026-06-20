@@ -521,13 +521,13 @@ window.buildPoolSchedule = function(){
 // ══════════════════════════════════════════════════════════
 function getPoolResult(matchId){
   const d = ST.results['pool-'+matchId];
-  if(!d) return { ga:'', gb:'', forfeit:null };
-  return { ga: d.ga??'', gb: d.gb??'', forfeit: d.forfeit||null };
+  if(!d) return { ga:'', gb:'' };
+  return { ga: d.ga??'', gb: d.gb??'' };
 }
-window.setPoolResult = async function(matchId, ga, gb, forfeit){
+window.setPoolResult = async function(matchId, ga, gb){
   if(!isScorer()) return;
   const key = 'pool-'+matchId;
-  const results = { ...ST.results, [key]: { ga, gb, forfeit: forfeit||null } };
+  const results = { ...ST.results, [key]: { ga, gb } };
   ST.results = results;
   await saveTournament({ results });
 };
@@ -535,7 +535,7 @@ window.setPoolResult = async function(matchId, ga, gb, forfeit){
 function computePoolStandings(pool){
   const ids = ST.pools[pool]||[];
   const stats = {};
-  ids.forEach(id=>stats[id]={ id, pts:0, j:0, g:0, n:0, p:0, bp:0, bc:0, diff:0, forfeits:0 });
+  ids.forEach(id=>stats[id]={ id, pts:0, j:0, g:0, n:0, p:0, bp:0, bc:0, diff:0 });
   const matches = ST.poolSchedule.filter(m=>m.pool===pool);
   matches.forEach(m=>{
     const r = getPoolResult(m.matchId);
@@ -545,12 +545,7 @@ function computePoolStandings(pool){
     if(!sa||!sb) return;
     sa.j++; sb.j++;
     sa.bp+=ga; sa.bc+=gb; sb.bp+=gb; sb.bc+=ga;
-    if(r.forfeit){
-      // forfait : l'équipe forfait perd -1 pt, l'adversaire gagne 3-0 (score forcé)
-      const loserKey = r.forfeit; // id de l'équipe forfait
-      if(loserKey===m.a){ sa.pts-=1; sa.forfeits++; sb.pts+=3; sb.g++; }
-      else if(loserKey===m.b){ sb.pts-=1; sb.forfeits++; sa.pts+=3; sa.g++; }
-    } else if(ga>gb){ sa.pts+=3; sa.g++; sb.p++; }
+    if(ga>gb){ sa.pts+=3; sa.g++; sb.p++; }
     else if(ga<gb){ sb.pts+=3; sb.g++; sa.p++; }
     else { sa.pts+=1; sb.pts+=1; sa.n++; sb.n++; }
   });
@@ -594,13 +589,13 @@ function poolRankTeam(pool, rank){
 // ══════════════════════════════════════════════════════════
 function getBracketResult(m){
   const d = ST.results['bracket-'+m];
-  if(!d) return { ga:'', gb:'', forfeit:null, shootout:null };
-  return { ga:d.ga??'', gb:d.gb??'', forfeit:d.forfeit||null, shootout:d.shootout||null };
+  if(!d) return { ga:'', gb:'', shootout:null };
+  return { ga:d.ga??'', gb:d.gb??'', shootout:d.shootout||null };
 }
-window.setBracketResult = async function(m, ga, gb, forfeit, shootout){
+window.setBracketResult = async function(m, ga, gb, shootout){
   if(!isScorer()) return;
   const key = 'bracket-'+m;
-  const results = { ...ST.results, [key]: { ga, gb, forfeit: forfeit||null, shootout: shootout||null } };
+  const results = { ...ST.results, [key]: { ga, gb, shootout: shootout||null } };
   ST.results = results;
   await saveTournament({ results });
 };
@@ -609,7 +604,6 @@ window.setBracketResult = async function(m, ga, gb, forfeit, shootout){
 function bracketMatchWinner(m){
   const r = getBracketResult(m);
   if(r.ga==='' || r.gb==='') return null;
-  if(r.forfeit) return r.forfeit==='a' ? bracketTeam(m,'b') : bracketTeam(m,'a');
   const ga=+r.ga, gb=+r.gb;
   if(ga>gb) return bracketTeam(m,'a');
   if(ga<gb) return bracketTeam(m,'b');
@@ -1513,71 +1507,78 @@ function renderBracketView(){
 window.setBracketRound = function(r){ ST.activeBracketRound=r; renderBracketView(); };
 
 // ── Carte de match (saisie score) ────────────────────────
+const _scoreDebounce = {}; // { 'type_matchId': timeoutId }
 function matchCardHTML(type, matchId, aId, bId, r, subtitle, needsShootout){
   const aName = aId?tName(aId):'<em>à déterminer</em>';
   const bName = bId?tName(bId):'<em>à déterminer</em>';
   const canEdit = isScorer() && aId && bId;
   const done = r.ga!==''&&r.gb!=='';
-  const forfeitBadge = r.forfeit ? `<span style="color:var(--red);font-size:10px;font-weight:700">⚠ Forfait ${r.forfeit==='a'?aName:bName}</span>` : '';
   let shootoutHTML='';
   if(needsShootout){
     const so=r.shootout||{};
     shootoutHTML = `<div style="margin-top:6px;padding:6px 10px;background:var(--ylw-bg);border-radius:6px;font-size:11px">
-      ⚽ <strong>Égalité — Tirs au but requis</strong>
+      ⚽ <strong>Égalité — Tirs au but requis</strong> <span style="color:var(--muted)">(ne compte pas au classement, désigne juste le vainqueur)</span>
       ${canEdit?`<div style="display:flex;gap:6px;align-items:center;margin-top:4px">
-        <input type="number" min="0" max="20" value="${so.ga??''}" style="width:50px" id="so_a_${matchId}" title="Tirs au but équipe A" aria-label="Tirs au but équipe A">
+        <input type="number" min="0" max="20" value="${so.ga??''}" style="width:50px" id="so_a_${matchId}" title="Tirs au but équipe A" aria-label="Tirs au but équipe A" oninput="scheduleAutoSaveShootout('${type}',${matchId})">
         <span>–</span>
-        <input type="number" min="0" max="20" value="${so.gb??''}" style="width:50px" id="so_b_${matchId}" title="Tirs au but équipe B" aria-label="Tirs au but équipe B">
-        <button class="btn btn-g btn-xs" onclick="saveShootout('${type}',${matchId})">✓ Valider T.A.B.</button>
+        <input type="number" min="0" max="20" value="${so.gb??''}" style="width:50px" id="so_b_${matchId}" title="Tirs au but équipe B" aria-label="Tirs au but équipe B" oninput="scheduleAutoSaveShootout('${type}',${matchId})">
+        <span id="so_status_${matchId}" style="font-size:10px;color:var(--muted)"></span>
       </div>`:(so.ga!=null?`<strong>${so.ga} – ${so.gb}</strong> T.A.B.`:'En attente de saisie')}
     </div>`;
   }
   return `<div style="background:var(--s1);border:1px solid var(--bdr);border-radius:10px;padding:12px 14px;margin-bottom:8px">
-    <div style="font-size:11px;color:var(--dim);margin-bottom:6px">${subtitle} ${forfeitBadge}</div>
+    <div style="font-size:11px;color:var(--dim);margin-bottom:6px">${subtitle}</div>
     <div style="display:flex;align-items:center;gap:10px">
       <div style="flex:1;font-weight:700">${aName}</div>
       ${canEdit ? `
-        <input type="number" min="0" max="50" value="${r.ga}" style="width:50px;text-align:center" id="sc_a_${type}_${matchId}" title="Score équipe A" aria-label="Score équipe A">
+        <input type="number" min="0" max="50" value="${r.ga}" style="width:50px;text-align:center" id="sc_a_${type}_${matchId}" title="Score équipe A" aria-label="Score équipe A" oninput="scheduleAutoSaveScore('${type}',${matchId})">
         <span>–</span>
-        <input type="number" min="0" max="50" value="${r.gb}" style="width:50px;text-align:center" id="sc_b_${type}_${matchId}" title="Score équipe B" aria-label="Score équipe B">
+        <input type="number" min="0" max="50" value="${r.gb}" style="width:50px;text-align:center" id="sc_b_${type}_${matchId}" title="Score équipe B" aria-label="Score équipe B" oninput="scheduleAutoSaveScore('${type}',${matchId})">
       ` : `<div style="font-family:'Oswald',sans-serif;font-size:18px">${done?`${r.ga} – ${r.gb}`:'–'}</div>`}
       <div style="flex:1;text-align:right;font-weight:700">${bName}</div>
     </div>
-    ${canEdit?`<div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">
-      <button class="btn btn-g btn-xs" onclick="saveMatchScore('${type}',${matchId})">✓ Valider</button>
-      <button class="btn btn-ghost btn-xs" style="color:var(--red);border-color:var(--red)" onclick="setForfeit('${type}',${matchId},'a')">Forfait ${aName}</button>
-      <button class="btn btn-ghost btn-xs" style="color:var(--red);border-color:var(--red)" onclick="setForfeit('${type}',${matchId},'b')">Forfait ${bName}</button>
-    </div>`:''}
+    ${canEdit?`<div style="font-size:10px;color:var(--muted);margin-top:4px;text-align:right" id="sc_status_${type}_${matchId}"></div>`:''}
     ${shootoutHTML}
   </div>`;
 }
-window.saveMatchScore = async function(type, matchId){
-  const ga = document.getElementById(`sc_a_${type}_${matchId}`).value;
-  const gb = document.getElementById(`sc_b_${type}_${matchId}`).value;
-  if(ga===''||gb===''){ alert('Renseignez les deux scores.'); return; }
-  if(type==='pool') await setPoolResult(matchId, +ga, +gb, null);
-  else await setBracketResult(matchId, +ga, +gb, null, null);
-  refreshCurrentPage();
+
+// Sauvegarde automatique du score, 800ms après la dernière frappe (debounce),
+// uniquement quand les deux champs sont remplis. Plus de bouton "Valider".
+window.scheduleAutoSaveScore = function(type, matchId){
+  const key = type+'_'+matchId;
+  clearTimeout(_scoreDebounce[key]);
+  const statusEl = document.getElementById(`sc_status_${type}_${matchId}`);
+  if(statusEl) statusEl.textContent='…';
+  _scoreDebounce[key] = setTimeout(async ()=>{
+    const aEl=document.getElementById(`sc_a_${type}_${matchId}`), bEl=document.getElementById(`sc_b_${type}_${matchId}`);
+    if(!aEl||!bEl) return;
+    const ga=aEl.value, gb=bEl.value;
+    if(ga===''||gb===''){ if(statusEl) statusEl.textContent=''; return; }
+    if(type==='pool') await setPoolResult(matchId, +ga, +gb, null);
+    else await setBracketResult(matchId, +ga, +gb, null, null);
+    if(statusEl) statusEl.textContent='✓ Enregistré';
+    refreshCurrentPage();
+  }, 800);
 };
-window.setForfeit = async function(type, matchId, side){
-  const fs = ST.cfg.forfeitScore||3;
-  const ga = side==='a' ? 0 : fs;
-  const gb = side==='a' ? fs : 0;
-  const loserId = type==='pool'
-    ? (side==='a' ? ST.poolSchedule.find(m=>m.matchId===matchId).a : ST.poolSchedule.find(m=>m.matchId===matchId).b)
-    : side;
-  if(type==='pool') await setPoolResult(matchId, ga, gb, loserId);
-  else await setBracketResult(matchId, ga, gb, side, null);
-  refreshCurrentPage();
+
+window.scheduleAutoSaveShootout = function(type, matchId){
+  const key = 'so_'+type+'_'+matchId;
+  clearTimeout(_scoreDebounce[key]);
+  const statusEl = document.getElementById(`so_status_${matchId}`);
+  if(statusEl) statusEl.textContent='…';
+  _scoreDebounce[key] = setTimeout(async ()=>{
+    const aEl=document.getElementById(`so_a_${matchId}`), bEl=document.getElementById(`so_b_${matchId}`);
+    if(!aEl||!bEl) return;
+    const ga=aEl.value, gb=bEl.value;
+    if(ga===''||gb===''){ if(statusEl) statusEl.textContent=''; return; }
+    if(+ga===+gb){ if(statusEl){ statusEl.textContent='⚠ Il faut un vainqueur (scores différents)'; statusEl.style.color='var(--red)'; } return; }
+    const r = getBracketResult(matchId);
+    await setBracketResult(matchId, r.ga, r.gb, null, { ga:+ga, gb:+gb });
+    if(statusEl){ statusEl.style.color='var(--muted)'; statusEl.textContent='✓ Enregistré'; }
+    refreshCurrentPage();
+  }, 800);
 };
-window.saveShootout = async function(type, matchId){
-  const ga = document.getElementById(`so_a_${matchId}`).value;
-  const gb = document.getElementById(`so_b_${matchId}`).value;
-  if(ga===''||gb===''||+ga===+gb){ alert('Les tirs au but doivent avoir un vainqueur (scores différents).'); return; }
-  const r = getBracketResult(matchId);
-  await setBracketResult(matchId, r.ga, r.gb, null, { ga:+ga, gb:+gb });
-  refreshCurrentPage();
-};
+
 
 // ══════════════════════════════════════════════════════════
 // PAGE 5 — CLASSEMENT FINAL
