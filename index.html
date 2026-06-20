@@ -37,7 +37,8 @@ const firebaseConfig = {
   messagingSenderId: "995068678625",
   appId: "1:995068678625:web:cbe198e586f4e928f802a0",
   measurementId: "G-D6ZFZR3XJN"
-};// ⚠️ Remplacez les valeurs ci-dessus par celles de VOTRE projet Firebase
+};
+// ⚠️ Remplacez les valeurs ci-dessus par celles de VOTRE projet Firebase
 // (créez un nouveau projet Firebase dédié à ce tournoi de foot, distinct du pickleball)
 
 const app       = initializeApp(firebaseConfig);
@@ -296,7 +297,7 @@ function subscribeToTournament(){
   });
 }
 async function saveTournament(partial){
-  if(!isAdmin()) return;
+  if(!isAdmin() && !isScorer()) return;
   try { await setDoc(doc(db,'foottournoi','current'), { ...partial, updatedAt: serverTimestamp() }, { merge:true }); }
   catch(e){ console.error('saveTournament', e); alert('Erreur de sauvegarde : '+e.message); }
 }
@@ -850,6 +851,58 @@ window.changeUserRole = async function(userId, newRole){
   }
 };
 
+// Création directe d'un compte staff (Auth + Firestore) depuis le panel admin.
+// ⚠️ createUserWithEmailAndPassword connecte automatiquement le nouveau compte
+// dans le navigateur (comportement du SDK Firebase) : on doit donc reconnecter
+// l'admin juste après avec son propre mot de passe.
+window.createStaffAccount = async function(){
+  if(!isAdmin()) return;
+  const name      = document.getElementById('newStaffName').value.trim();
+  const email     = document.getElementById('newStaffEmail').value.trim();
+  const pwd       = document.getElementById('newStaffPwd').value;
+  const role      = document.getElementById('newStaffRole').value;
+  const adminPwd  = document.getElementById('adminPwdConfirm').value;
+  const msgEl     = document.getElementById('newStaffMsg');
+  const setMsg = (txt,color)=>{ if(msgEl){ msgEl.textContent=txt; msgEl.style.color = color==='red'?'var(--red)':'var(--grn)'; } };
+
+  if(!name||!email||!pwd){ setMsg('Remplissez nom, email et mot de passe.','red'); return; }
+  if(pwd.length<6){ setMsg('Le mot de passe doit faire au moins 6 caractères.','red'); return; }
+  if(!adminPwd){ setMsg('Indiquez votre propre mot de passe admin pour la reconnexion automatique.','red'); return; }
+
+  const adminEmail = CURRENT_USER ? CURRENT_USER.email : null;
+  if(!adminEmail){ setMsg('Reconnectez-vous en admin (email/mot de passe) avant de créer un compte staff.','red'); return; }
+
+  setMsg('Création en cours…','grn');
+  try {
+    // 1. Crée le compte Auth (connecte automatiquement ce nouveau compte)
+    const cred = await createUserWithEmailAndPassword(auth, email, pwd);
+    const newUid = cred.user.uid;
+    await updateProfile(cred.user, { displayName: name });
+
+    // 2. Crée la fiche Firestore avec le rôle choisi
+    await setDoc(doc(db,'users',newUid), {
+      email, name, role, createdAt: serverTimestamp(), createdBy: adminEmail
+    });
+
+    // 3. Reconnecte l'admin avec son propre mot de passe
+    await signInWithEmailAndPassword(auth, adminEmail, adminPwd);
+
+    setMsg(`✓ Compte staff créé pour ${name} (${roleBadge(role)}). Vous êtes reconnecté en admin.`,'grn');
+    document.getElementById('newStaffName').value='';
+    document.getElementById('newStaffEmail').value='';
+    document.getElementById('newStaffPwd').value='';
+    document.getElementById('adminPwdConfirm').value='';
+    loadUsersList();
+  } catch(e){
+    console.error('createStaffAccount', e);
+    setMsg('Erreur : '+authErrMsg(e.code)+(e.code?'':(' '+e.message)),'red');
+    // Si la reconnexion admin a échoué après une création réussie, on prévient clairement.
+    if(auth.currentUser && auth.currentUser.email !== adminEmail){
+      setMsg('Compte staff créé, mais la reconnexion admin a échoué (mot de passe admin incorrect ?). Reconnectez-vous manuellement.','red');
+    }
+  }
+};
+
 // Permet à un utilisateur déjà connecté de rafraîchir son propre rôle
 // sans avoir à se déconnecter/reconnecter (utile juste après qu'un admin
 // l'ait promu scorer/admin).
@@ -1288,14 +1341,27 @@ window.setPoolSlot = function(s){ ST.activePoolRound=s; renderPoolsView(); };
 
 function renderPoolStandingsPanel(){
   const el=document.getElementById('poolStandingsPanel'); if(!el) return;
-  el.innerHTML = `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px">` +
+  el.innerHTML = `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:10px">` +
     ['A','B','C','D'].map(p=>{
       const st=computePoolStandings(p);
-      return `<div style="background:var(--s1);border:1px solid var(--bdr);border-radius:8px;padding:8px 10px">
+      return `<div style="background:var(--s1);border:1px solid var(--bdr);border-radius:8px;padding:8px 10px;overflow-x:auto">
         <div style="font-family:'Oswald',sans-serif;font-size:13px;color:var(--blu);margin-bottom:4px">Poule ${p}</div>
-        <table style="width:100%;font-size:11px;border-collapse:collapse">
-          <thead><tr style="color:var(--dim);font-size:9px"><th style="text-align:left">#</th><th style="text-align:left">Équipe</th><th>Pts</th><th>J</th><th>+/-</th></tr></thead>
-          <tbody>${st.map((s,i)=>`<tr style="border-top:1px solid var(--bdr)"><td>${i+1}</td><td>${tName(s.id)}</td><td style="text-align:center;font-weight:700">${s.pts}</td><td style="text-align:center">${s.j}</td><td style="text-align:center">${s.diff>0?'+':''}${s.diff}</td></tr>`).join('')}</tbody>
+        <table style="width:100%;font-size:11px;border-collapse:collapse;white-space:nowrap">
+          <thead><tr style="color:var(--dim);font-size:9px">
+            <th style="text-align:left">#</th><th style="text-align:left">Équipe</th>
+            <th>Pts</th><th>MJ</th><th>V</th><th>N</th><th>P</th><th>Bp</th><th>Bc</th><th>+/-</th>
+          </tr></thead>
+          <tbody>${st.map((s,i)=>`<tr style="border-top:1px solid var(--bdr)">
+            <td>${i+1}</td><td>${tName(s.id)}</td>
+            <td style="text-align:center;font-weight:700">${s.pts}</td>
+            <td style="text-align:center">${s.j}</td>
+            <td style="text-align:center">${s.g}</td>
+            <td style="text-align:center">${s.n}</td>
+            <td style="text-align:center">${s.p}</td>
+            <td style="text-align:center">${s.bp}</td>
+            <td style="text-align:center">${s.bc}</td>
+            <td style="text-align:center">${s.diff>0?'+':''}${s.diff}</td>
+          </tr>`).join('')}</tbody>
         </table>
       </div>`;
     }).join('') + `</div>`;
@@ -1826,7 +1892,28 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
       <span style="font-size:11px;color:var(--muted)">Changez le rôle pour donner l'accès à la saisie des scores (scorer) ou l'accès complet (admin).</span>
     </div>
     <div id="usersList" style="max-height:320px;overflow-y:auto"></div>
+
+    <div style="margin-top:16px;border-top:1px solid var(--bdr);padding-top:14px">
+      <strong style="font-size:13px">➕ Créer un compte staff</strong>
+      <div id="newStaffMsg" style="font-size:12px;min-height:16px;margin:6px 0"></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
+        <input type="text" id="newStaffName" placeholder="Nom complet">
+        <select id="newStaffRole">
+          <option value="scorer" selected>✏️ Scorer (saisie scores)</option>
+          <option value="admin">👑 Admin</option>
+          <option value="spectator">👁 Spectateur</option>
+        </select>
+        <input type="email" id="newStaffEmail" placeholder="email@exemple.com">
+        <input type="password" id="newStaffPwd" placeholder="Mot de passe (min. 6 car.)">
+      </div>
+      <div style="margin-bottom:8px">
+        <label style="font-size:11px;color:var(--muted)">Votre mot de passe admin (pour vous reconnecter automatiquement après création)</label>
+        <input type="password" id="adminPwdConfirm" placeholder="Votre mot de passe admin">
+      </div>
+      <button class="btn btn-g btn-sm" onclick="createStaffAccount()">✓ Créer le compte staff</button>
+    </div>
   </div>
+
 </div>
 
 <!-- SPECTATOR NAV -->
