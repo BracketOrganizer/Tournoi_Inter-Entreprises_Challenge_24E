@@ -62,8 +62,10 @@ const ST = {
   pools:{A:[],B:[],C:[],D:[]}, // ids d'équipes par poule
   poolSchedule:[], // matchs de phase de poules [{m,pool,a,b,time,court}]
   poolTabSlot:null,    // créneau "TAB possible" réservé en fin de phase de poules {time,slot}
+  poolBreaks:[],        // coupures réellement insérées pendant les poules [{afterSlot,startTime,endTime,label,duration}]
   bracketSchedule:[], // matchs phase finale [{m,time,court}]
   bracketTabSlots:[],  // créneaux "TAB possible" après chaque tour [{round,slot,time}]
+  bracketBreaks:[],     // coupures réellement insérées pendant la phase finale
   results:{},      // clé "pool-M" ou "bracket-M" -> {ga,gb,shootout:{ga,gb}}
   activeView:'pools', // 'pools' | 'bracket'
   activePoolRound:0,
@@ -82,7 +84,7 @@ const ST = {
     // créneau en cours le plus proche de l'heure visée (jamais en plein milieu
     // d'un créneau), peu importe qu'on soit en phase de poules ou en finale.
     breaks:[ { time:'12:00', duration:45, label:'Pause déjeuner' } ],
-    shootoutBreaks:true,  // pauses tirs au but signalées à certains tours
+    tabDuration:10,        // durée allouée à un créneau T.A.B. (minutes), réglable
     draw:'order'           // 'order' | 'random' | 'random-no-club'
   }
 };
@@ -106,22 +108,27 @@ function timeToMinutes(timeStr){
 
 // ══════════════════════════════════════════════════════════
 // TIMELINE CONTINUE AVEC COUPURES MULTIPLES
-// Calcule l'horaire de chaque créneau (slot 0,1,2...) en partant de `startTime`,
-// chaque créneau durant `slotDuration` minutes. Les coupures (ST.cfg.breaks)
+// Calcule l'horaire de chaque créneau (slot 0,1,2...) en partant de `startTime`.
+// `slotDurations` peut être un nombre (durée uniforme pour tous les créneaux)
+// ou un tableau (une durée par créneau, ex: créneaux de match normaux + un
+// créneau T.A.B. de durée différente à la fin). Les coupures (ST.cfg.breaks)
 // s'insèrent dès que l'horaire du créneau EN COURS atteint ou dépasse l'heure
 // de la coupure : la coupure démarre alors à la FIN de ce créneau (jamais en
 // plein milieu), et tout ce qui suit est décalé d'autant. Une coupure ne peut
 // s'appliquer qu'une seule fois sur l'ensemble de la timeline (poules+finale).
-// Retourne un tableau de chaînes "HH:MM", une par slot, indexé comme l'argument
-// `slotCount`.
+// Retourne { times: ["HH:MM",...], insertedBreaks: [{afterSlot, startTime, endTime, label}] }
+// — `insertedBreaks` permet d'afficher la coupure dans le planning, juste
+// après le créneau qui la précède chronologiquement.
 // ══════════════════════════════════════════════════════════
-function computeSlotTimes(startTime, slotDuration, slotCount, breaks, appliedBreaksSet){
+function computeSlotTimes(startTime, slotDurations, slotCount, breaks, appliedBreaksSet){
+  const durFor = i => Array.isArray(slotDurations) ? (slotDurations[i] ?? slotDurations[slotDurations.length-1]) : slotDurations;
   const sortedBreaks = (breaks||[]).slice().sort((a,b)=>timeToMinutes(a.time)-timeToMinutes(b.time));
   const times = [];
+  const insertedBreaks = [];
   let cursor = timeToMinutes(startTime);
   for(let i=0;i<slotCount;i++){
     times.push(cursor);
-    const slotEnd = cursor + slotDuration;
+    const slotEnd = cursor + durFor(i);
     // Une coupure s'applique si son heure tombe dans [début, fin] de CE créneau
     // et qu'elle n'a pas déjà été consommée plus tôt dans la timeline.
     for(const brk of sortedBreaks){
@@ -130,7 +137,10 @@ function computeSlotTimes(startTime, slotDuration, slotCount, breaks, appliedBre
       const brkMin = timeToMinutes(brk.time);
       if(brkMin >= cursor && brkMin < slotEnd){
         appliedBreaksSet.add(key);
-        cursor = slotEnd + brk.duration;
+        const startMin = slotEnd, endMin = slotEnd + brk.duration;
+        const fmt = mins => { const hh=Math.floor(mins/60)%24, mm=mins%60; return String(hh).padStart(2,'0')+':'+String(mm).padStart(2,'0'); };
+        insertedBreaks.push({ afterSlot:i, startTime: fmt(startMin), endTime: fmt(endMin), label: brk.label||'Coupure', duration: brk.duration });
+        cursor = endMin;
         // on a déjà avancé cursor pour cette coupure ; sort pour ne pas en
         // appliquer une seconde sur le même créneau (rare mais possible si
         // deux coupures très proches) — elle sera traitée au slot suivant.
@@ -139,10 +149,11 @@ function computeSlotTimes(startTime, slotDuration, slotCount, breaks, appliedBre
     }
     if(cursor === times[i]) cursor = slotEnd; // pas de coupure : avance normalement
   }
-  return times.map(mins=>{
+  const formattedTimes = times.map(mins=>{
     const hh=Math.floor(mins/60)%24, mm=mins%60;
     return String(hh).padStart(2,'0')+':'+String(mm).padStart(2,'0');
   });
+  return { times: formattedTimes, insertedBreaks };
 }
 function shuffle(arr){ const a=[...arr]; for(let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; } return a; }
 
@@ -367,8 +378,10 @@ function subscribeToTournament(){
     if(data.pools)           ST.pools           = data.pools;
     if(data.poolSchedule)    ST.poolSchedule    = data.poolSchedule;
     ST.poolTabSlot      = data.poolTabSlot || null;
+    ST.poolBreaks       = data.poolBreaks || [];
     if(data.bracketSchedule) ST.bracketSchedule = data.bracketSchedule;
     ST.bracketTabSlots  = data.bracketTabSlots || [];
+    ST.bracketBreaks    = data.bracketBreaks || [];
     if(data.results)         ST.results         = data.results;
     if(data.phase)           ST.phase           = data.phase;
     ST.liveOpen = data.liveOpen === true;
@@ -565,16 +578,20 @@ window.buildPoolSchedule = function(){
   const tabSlotIdx = slotIdx; // dernier slot = TAB
   const totalSlots = slotIdx+1;
 
+  const matchSlotDur = cfg.matchDur+cfg.tt;
+  const tabDur = cfg.tabDuration||10;
+  const slotDurations = Array.from({length:totalSlots}, (_,i)=> i===tabSlotIdx ? tabDur : matchSlotDur);
   const appliedBreaks = new Set();
-  const slotTimes = computeSlotTimes(cfg.start, cfg.matchDur+cfg.tt, totalSlots, cfg.breaks, appliedBreaks);
+  const { times: slotTimes, insertedBreaks } = computeSlotTimes(cfg.start, slotDurations, totalSlots, cfg.breaks, appliedBreaks);
 
   const finalSchedule = rawSchedule.map(m=>({ ...m, time: slotTimes[m.slot] }));
 
   ST.poolSchedule = finalSchedule;
   ST.poolTabSlot = { time: slotTimes[tabSlotIdx], slot: tabSlotIdx }; // créneau TAB de poule (info)
+  ST.poolBreaks = insertedBreaks; // coupures réellement insérées pendant la phase de poules (affichage planning)
   ST.results = {};
   ST.phase='pools';
-  saveTournament({ poolSchedule: finalSchedule, poolTabSlot: ST.poolTabSlot, results:{}, phase:'pools', bracketSchedule:[] });
+  saveTournament({ poolSchedule: finalSchedule, poolTabSlot: ST.poolTabSlot, poolBreaks: insertedBreaks, results:{}, phase:'pools', bracketSchedule:[] });
   renderPlanningPreview();
 };
 
@@ -641,6 +658,25 @@ function allPoolStandings(){
   ['A','B','C','D'].forEach(p=>out[p]=computePoolStandings(p));
   return out;
 }
+
+// ── T.A.B. de poule (créneau réservé, informatif) ────────
+// Stocké sous results['pool-tab-{pool}'] = { teamA, teamB, ga, gb }.
+// L'admin/scorer choisit librement les 2 équipes concernées (l'égalité peut
+// survenir à n'importe quel rang du classement), saisit les buts au T.A.B.
+// Ne compte jamais au classement — désigne juste un vainqueur informatif.
+function getPoolTabResult(pool){
+  const d = ST.results['pool-tab-'+pool];
+  return d || { teamA:'', teamB:'', ga:'', gb:'' };
+}
+window.savePoolTab = async function(pool, patch){
+  if(!isScorer()) return;
+  const key = 'pool-tab-'+pool;
+  const current = getPoolTabResult(pool);
+  const results = { ...ST.results, [key]: { ...current, ...patch } };
+  ST.results = results;
+  await saveTournament({ results });
+};
+
 function poolRankTeam(pool, rank){
   const st = computePoolStandings(pool);
   return st[rank-1] ? st[rank-1].id : null;
@@ -701,6 +737,12 @@ window.generateBracket = function(){
 
   const cfg = ST.cfg;
   const courts = cfg.courts||4;
+  if(courts<4){
+    alert('La répartition spéciale de la finale (3e-8e place sur les terrains B/C/D puis finale seule sur le terrain A) nécessite au moins 4 terrains. Configurez au moins 4 terrains (page Config) avant de générer la phase finale.');
+    return;
+  }
+  const matchSlotDur = cfg.matchDurBracket+cfg.tt;
+  const tabDur = cfg.tabDuration||10;
 
   // Départ de la phase finale = juste après le dernier créneau de poules
   // (TAB de poule inclus), en continuité de la même timeline — la phase finale
@@ -710,39 +752,85 @@ window.generateBracket = function(){
     : (ST.poolSchedule.length ? ST.poolSchedule[ST.poolSchedule.length-1].time : cfg.start);
   const start = addMinutes(lastPoolTime, cfg.matchDur+cfg.tt);
 
-  // Construit les créneaux horaires pour chaque tour du bracket (12,12,12 matchs),
-  // avec un créneau "TAB possible" systématique inséré après CHAQUE tour
-  // (au cas où un ou plusieurs matchs du tour se terminent à égalité).
+  // Matchs du tour 3 traités à part : 3e-4e (m35), 5e-6e (m34), 7e-8e (m33)
+  // joués en même temps sur les terrains B, C, D ; la finale 1ère-2e (m36)
+  // se joue ENSUITE, seule, sur le terrain A.
+  const ROUND3_PODIUM_NUMS = [33,34,35]; // 7-8e, 5-6e, 3-4e
+  const ROUND3_FINAL_NUM   = 36;          // finale 1-2e
+  const round3Rest = BRACKET_ROUND3.filter(b=>!ROUND3_PODIUM_NUMS.includes(b.m) && b.m!==ROUND3_FINAL_NUM); // places 9e à 24e
+
   const rawSchedule=[];
   const tabSlots=[]; // { round, slot }
+  const slotDurations=[];
   let slotIdx=0;
-  [BRACKET_ROUND1, BRACKET_ROUND2, BRACKET_ROUND3].forEach((round,ri)=>{
+
+  // ── Tours 1 et 2 : inchangés (créneaux de `courts` matchs + TAB après) ──
+  [BRACKET_ROUND1, BRACKET_ROUND2].forEach((round,ri)=>{
     for(let i=0;i<round.length;i+=courts){
       const slot = round.slice(i,i+courts);
       slot.forEach((b,ci)=>{
         rawSchedule.push({ m:b.m, round:ri+1, court:ci+1, slot:slotIdx, label: b.label||null });
       });
+      slotDurations.push(matchSlotDur);
       slotIdx++;
     }
-    // créneau TAB systématique après ce tour
     tabSlots.push({ round: ri+1, slot: slotIdx });
+    slotDurations.push(tabDur);
     slotIdx++;
   });
+
+  // ── Tour 3, partie 1 : places 9e à 24e (6 matchs, créneaux normaux) ──
+  for(let i=0;i<round3Rest.length;i+=courts){
+    const slot = round3Rest.slice(i,i+courts);
+    slot.forEach((b,ci)=>{
+      rawSchedule.push({ m:b.m, round:3, court:ci+1, slot:slotIdx, label: b.label||null });
+    });
+    slotDurations.push(matchSlotDur);
+    slotIdx++;
+  }
+
+  // ── Tour 3, partie 2 : 7-8e / 5-6e / 3-4e en même temps sur B, C, D (terrains 2,3,4) ──
+  const podiumSlotIdx = slotIdx;
+  ROUND3_PODIUM_NUMS.forEach((mNum,ci)=>{
+    const b = BRACKET_BY_NUM[mNum];
+    rawSchedule.push({ m:mNum, round:3, court:ci+2, slot:podiumSlotIdx, label: b.label||null }); // terrains 2(B),3(C),4(D)
+  });
+  slotDurations.push(matchSlotDur);
+  slotIdx++;
+
+  // créneau TAB dédié pour ce bloc 3e-8e (avant la finale, au cas où l'un de
+  // ces 3 matchs se termine à égalité).
+  tabSlots.push({ round: 3, slot: slotIdx, label:'T.A.B. — places 3e à 8e' });
+  slotDurations.push(tabDur);
+  slotIdx++;
+
+  // ── Tour 3, partie 3 : finale 1ère-2e place, SEULE sur le terrain A (terrain 1) ──
+  const finalSlotIdx = slotIdx;
+  const finalB = BRACKET_BY_NUM[ROUND3_FINAL_NUM];
+  rawSchedule.push({ m:ROUND3_FINAL_NUM, round:3, court:1, slot:finalSlotIdx, label: finalB.label||null });
+  slotDurations.push(matchSlotDur);
+  slotIdx++;
+
+  // créneau TAB final (pour la finale elle-même, en cas d'égalité).
+  tabSlots.push({ round: 3, slot: slotIdx, label:'T.A.B. — Finale' });
+  slotDurations.push(tabDur);
+  slotIdx++;
 
   const totalSlots = slotIdx;
   // Reprend les coupures déjà consommées pendant les poules (pour ne pas les
   // réappliquer), puis poursuit la timeline sur la phase finale.
   const poolTimes = ST.poolSchedule.map(m=>m.time).concat(ST.poolTabSlot?[ST.poolTabSlot.time]:[]);
   const appliedBreaks = appliedBreaksFromSchedule(poolTimes, cfg.breaks);
-  const slotTimes = computeSlotTimes(start, cfg.matchDurBracket+cfg.tt, totalSlots, cfg.breaks, appliedBreaks);
+  const { times: slotTimes, insertedBreaks } = computeSlotTimes(start, slotDurations, totalSlots, cfg.breaks, appliedBreaks);
 
   const schedule = rawSchedule.map(m=>({ ...m, time: slotTimes[m.slot] }));
   const tabSlotsWithTime = tabSlots.map(t=>({ ...t, time: slotTimes[t.slot] }));
 
   ST.bracketSchedule = schedule;
-  ST.bracketTabSlots = tabSlotsWithTime; // créneaux TAB après chaque tour (info)
+  ST.bracketTabSlots = tabSlotsWithTime; // créneaux TAB après chaque tour + bloc podium + finale (info)
+  ST.bracketBreaks = insertedBreaks; // coupures réellement insérées pendant la phase finale (affichage planning)
   ST.phase = 'bracket';
-  saveTournament({ bracketSchedule: schedule, bracketTabSlots: tabSlotsWithTime, phase:'bracket' });
+  saveTournament({ bracketSchedule: schedule, bracketTabSlots: tabSlotsWithTime, bracketBreaks: insertedBreaks, phase:'bracket' });
   renderTournamentPage();
 };
 
@@ -1180,6 +1268,7 @@ function getCfg(){
     tt:             +(document.getElementById('cfg_tt')?.value||4),
     start:          document.getElementById('cfg_start')?.value||'09:00',
     breaks:         _breaksDraft.filter(b=>b.time).map(b=>({ time:b.time, duration:b.duration||0, label:b.label||'Coupure' })),
+    tabDuration:    +(document.getElementById('cfg_tabdur')?.value||10),
     draw:           document.getElementById('cfg_draw')?.value||'order',
   };
 }
@@ -1193,6 +1282,7 @@ function renderCfgForm(){
   setV('cfg_tt', c.tt);
   setV('cfg_start', c.start);
   setV('cfg_draw', c.draw||'order');
+  setV('cfg_tabdur', c.tabDuration||10);
   _breaksDraft = (c.breaks && c.breaks.length) ? c.breaks.map(b=>({...b})) : [{ time:'12:00', duration:45, label:'Pause déjeuner' }];
   renderBreaksList();
   onCfgChange();
@@ -1369,21 +1459,34 @@ function renderPlanningPreview(){
   const bySlot = {};
   ST.poolSchedule.forEach(m=>{ (bySlot[m.slot]=bySlot[m.slot]||[]).push(m); });
   const slots = Object.keys(bySlot).map(Number).sort((a,b)=>a-b);
+  const breaksAfter = {}; // { slotIdx: [break,...] }
+  (ST.poolBreaks||[]).forEach(b=>{ (breaksAfter[b.afterSlot]=breaksAfter[b.afterSlot]||[]).push(b); });
+
+  function breakHTML(b){
+    return `<div style="background:rgba(180,60,60,.08);border:1px dashed #b43c3c;border-radius:8px;padding:10px 14px;margin-bottom:8px">
+      <div style="font-family:'Oswald',sans-serif;font-size:22px;font-weight:700;color:#b43c3c;margin-bottom:2px">🕐 ${b.startTime} – ${b.endTime}</div>
+      <div style="font-size:12px">☕ <strong>${b.label}</strong> (${b.duration} min)</div>
+    </div>`;
+  }
+
   let html = slots.map(s=>{
     const matches = bySlot[s];
     const time = matches[0].time;
-    return `<div style="background:var(--s2);border:1px solid var(--bdr);border-radius:8px;padding:10px 14px;margin-bottom:8px">
+    let block = `<div style="background:var(--s2);border:1px solid var(--bdr);border-radius:8px;padding:10px 14px;margin-bottom:8px">
       <div style="font-family:'Oswald',sans-serif;font-size:22px;font-weight:700;color:var(--blu);margin-bottom:6px">🕐 ${time}</div>
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:6px">
         ${matches.map(m=>`<div style="font-size:12px"><strong>T${m.court}</strong> Poule ${m.pool} : ${tName(m.a)} – ${tName(m.b)}</div>`).join('')}
       </div>
     </div>`;
+    if(breaksAfter[s]) block += breaksAfter[s].map(breakHTML).join('');
+    return block;
   }).join('');
   if(ST.poolTabSlot){
     html += `<div style="background:var(--ylw-bg);border:1px dashed var(--ylw);border-radius:8px;padding:10px 14px;margin-bottom:8px">
       <div style="font-family:'Oswald',sans-serif;font-size:22px;font-weight:700;color:var(--ylw);margin-bottom:2px">🕐 ${ST.poolTabSlot.time}</div>
       <div style="font-size:12px">⚽ Créneau réservé — <strong>T.A.B. possible</strong> en cas d'égalité parfaite au classement d'une poule (facultatif, ne compte pas pour le classement)</div>
     </div>`;
+    if(breaksAfter[ST.poolTabSlot.slot]) html += breaksAfter[ST.poolTabSlot.slot].map(breakHTML).join('');
   }
   el.innerHTML = html;
 }
@@ -1547,29 +1650,97 @@ function renderPoolsView(){
   const bySlot={};
   ST.poolSchedule.forEach(m=>{ (bySlot[m.slot]=bySlot[m.slot]||[]).push(m); });
   const slots=Object.keys(bySlot).map(Number).sort((a,b)=>a-b);
+  const TAB_SLOT_KEY = 'TAB'; // pseudo-slot dédié au créneau T.A.B. de poule
 
-  // Onglets de créneaux
+  // Onglets de créneaux (+ 1 onglet dédié T.A.B. à la fin)
   const tabsEl=document.getElementById('poolSlotTabs');
   if(tabsEl){
-    tabsEl.innerHTML = slots.map(s=>{
+    let html = slots.map(s=>{
       const matches=bySlot[s];
       const done = matches.every(m=>{ const r=getPoolResult(m.matchId); return r.ga!==''&&r.gb!==''; });
       return `<button class="rtab ${s===ST.activePoolRound?'active':''} ${done?'done':''}" onclick="setPoolSlot(${s})">Créneau ${s+1}${done?' ✓':''}<span class="rtab-time">${matches[0].time}</span></button>`;
     }).join('');
+    if(ST.poolTabSlot){
+      html += `<button class="rtab ${ST.activePoolRound===TAB_SLOT_KEY?'active':''}" onclick="setPoolSlot('${TAB_SLOT_KEY}')" style="border-color:var(--ylw)">⚽ T.A.B.<span class="rtab-time">${ST.poolTabSlot.time}</span></button>`;
+    }
+    tabsEl.innerHTML = html;
+  }
+
+  const listEl = document.getElementById('poolMatchList');
+  if(ST.activePoolRound===TAB_SLOT_KEY){
+    if(listEl) listEl.innerHTML = poolTabFormHTML();
+    renderPoolStandingsPanel();
+    return;
   }
 
   const matches = bySlot[ST.activePoolRound]||[];
-  const listEl = document.getElementById('poolMatchList');
   if(listEl){
-    listEl.innerHTML = matches.map(m=>{
+    let html = matches.map(m=>{
       const r=getPoolResult(m.matchId);
       return matchCardHTML('pool', m.matchId, m.a, m.b, r, `Poule ${m.pool}`, m.court, m.time);
     }).join('');
+    const breaksAfter = (ST.poolBreaks||[]).filter(b=>b.afterSlot===ST.activePoolRound);
+    breaksAfter.forEach(b=>{
+      html += `<div style="background:rgba(180,60,60,.08);border:1px dashed #b43c3c;border-radius:8px;padding:10px 14px;margin-top:4px">
+        <div style="font-family:'Oswald',sans-serif;font-size:22px;font-weight:700;color:#b43c3c;margin-bottom:2px">🕐 ${b.startTime} – ${b.endTime}</div>
+        <div style="font-size:12px">☕ <strong>${b.label}</strong> (${b.duration} min) — prochain créneau après cette coupure</div>
+      </div>`;
+    });
+    listEl.innerHTML = html;
   }
 
   renderPoolStandingsPanel();
 }
 window.setPoolSlot = function(s){ ST.activePoolRound=s; renderPoolsView(); };
+
+// Formulaire de saisie du T.A.B. de poule : 2 équipes choisies librement
+// (l'égalité peut survenir à n'importe quel rang/poule) + 2 petits champs de
+// score pour désigner le vainqueur. Une ligne par poule (A,B,C,D), au cas où
+// plusieurs poules ont besoin d'un T.A.B. sur ce même créneau réservé.
+function poolTabFormHTML(){
+  const canEdit = isScorer();
+  return `<div class="info info-y" style="margin-bottom:10px">
+      ⚽ Créneau réservé aux T.A.B. en cas d'égalité parfaite au classement d'une poule. Choisissez les 2 équipes concernées et saisissez le résultat. Ne compte pas pour le classement — désigne seulement un vainqueur.
+    </div>` +
+    ['A','B','C','D'].map(p=>{
+      const teams = ST.pools[p]||[];
+      const tab = getPoolTabResult(p);
+      const done = tab.ga!==''&&tab.gb!=='';
+      return `<div style="background:var(--s1);border:1px solid var(--bdr);border-radius:10px;padding:12px 14px;margin-bottom:8px">
+        <div style="font-size:11px;color:var(--dim);margin-bottom:6px">Poule ${p}</div>
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          ${canEdit?`
+            <select id="tab_teamA_${p}" style="flex:1;min-width:120px" onchange="savePoolTab('${p}',{teamA:this.value})">
+              <option value="">— Équipe 1 —</option>
+              ${teams.map(t=>`<option value="${t}" ${tab.teamA===t?'selected':''}>${tName(t)}</option>`).join('')}
+            </select>
+            <input type="number" min="0" max="20" value="${tab.ga}" style="width:42px;text-align:center" id="tab_ga_${p}" title="Buts équipe 1" aria-label="Buts équipe 1" onfocus="this.select()" oninput="scheduleAutoSavePoolTab('${p}')">
+            <span>–</span>
+            <input type="number" min="0" max="20" value="${tab.gb}" style="width:42px;text-align:center" id="tab_gb_${p}" title="Buts équipe 2" aria-label="Buts équipe 2" onfocus="this.select()" oninput="scheduleAutoSavePoolTab('${p}')">
+            <select id="tab_teamB_${p}" style="flex:1;min-width:120px" onchange="savePoolTab('${p}',{teamB:this.value})">
+              <option value="">— Équipe 2 —</option>
+              ${teams.map(t=>`<option value="${t}" ${tab.teamB===t?'selected':''}>${tName(t)}</option>`).join('')}
+            </select>
+          `:`<div style="font-size:13px">${tab.teamA?tName(tab.teamA):'—'} ${done?`<strong>${tab.ga} – ${tab.gb}</strong>`:'vs'} ${tab.teamB?tName(tab.teamB):'—'}</div>`}
+          <span id="tab_status_${p}" style="font-size:10px;color:var(--muted)">${done?'✓ Enregistré':''}</span>
+        </div>
+      </div>`;
+    }).join('');
+}
+const _poolTabDebounce = {};
+window.scheduleAutoSavePoolTab = function(pool){
+  clearTimeout(_poolTabDebounce[pool]);
+  const statusEl = document.getElementById(`tab_status_${pool}`);
+  if(statusEl) statusEl.textContent='…';
+  _poolTabDebounce[pool] = setTimeout(async ()=>{
+    const gaEl=document.getElementById(`tab_ga_${pool}`), gbEl=document.getElementById(`tab_gb_${pool}`);
+    if(!gaEl||!gbEl) return;
+    const ga=gaEl.value, gb=gbEl.value;
+    if(ga===''||gb===''){ if(statusEl) statusEl.textContent=''; return; }
+    await savePoolTab(pool, { ga:+ga, gb:+gb });
+    if(statusEl) statusEl.textContent='✓ Enregistré';
+  }, 800);
+};
 
 const POOL_COLORS = {
   A: { main:'#2f6fed', bg:'rgba(47,111,237,.10)' },   // bleu
@@ -1637,25 +1808,48 @@ function renderBracketView(){
   }
 
   const matches = ST.bracketSchedule.filter(b=>b.round===ST.activeBracketRound);
+  const tabSlotsForRound = (ST.bracketTabSlots||[]).filter(t=>t.round===ST.activeBracketRound);
   const listEl = document.getElementById('bracketMatchList');
   if(listEl){
     if(!matches.length){
       listEl.innerHTML='<div class="info info-y">Phase finale non générée.</div>';
     } else {
-      let html = matches.map(b=>{
-        const a=bracketTeam(b.m,'a'), bb=bracketTeam(b.m,'b');
-        const r=getBracketResult(b.m);
-        const label = b.label || bracketLabel(b.m);
-        const needsShootout = r.ga!==''&&r.gb!==''&&(+r.ga===+r.gb);
-        return matchCardHTML('bracket', b.m, a, bb, r, label, b.court, b.time, needsShootout);
+      // Regroupe les matchs par créneau (slot), puis interleave avec les
+      // créneaux T.A.B. selon leur position chronologique (un tour peut
+      // désormais contenir plusieurs blocs : ex. places 9-24e, puis 3-8e +
+      // T.A.B., puis finale seule + T.A.B.).
+      const bySlot = {};
+      matches.forEach(b=>{ (bySlot[b.slot]=bySlot[b.slot]||[]).push(b); });
+      const breaksAfter = {};
+      (ST.bracketBreaks||[]).forEach(b=>{ (breaksAfter[b.afterSlot]=breaksAfter[b.afterSlot]||[]).push(b); });
+      const allSlotNums = [...new Set([...matches.map(b=>b.slot), ...tabSlotsForRound.map(t=>t.slot)])].sort((a,b)=>a-b);
+      let html = allSlotNums.map(s=>{
+        let block = '';
+        if(bySlot[s]){
+          block = bySlot[s].map(b=>{
+            const a=bracketTeam(b.m,'a'), bb=bracketTeam(b.m,'b');
+            const r=getBracketResult(b.m);
+            const label = b.label || bracketLabel(b.m);
+            const needsShootout = r.ga!==''&&r.gb!==''&&(+r.ga===+r.gb);
+            return matchCardHTML('bracket', b.m, a, bb, r, label, b.court, b.time, needsShootout);
+          }).join('');
+        } else {
+          const tabSlot = tabSlotsForRound.find(t=>t.slot===s);
+          if(tabSlot){
+            block = `<div style="background:var(--ylw-bg);border:1px dashed var(--ylw);border-radius:8px;padding:10px 14px;margin:4px 0">
+              <div style="font-family:'Oswald',sans-serif;font-size:22px;font-weight:700;color:var(--ylw);margin-bottom:2px">🕐 ${tabSlot.time}</div>
+              <div style="font-size:12px">⚽ Créneau réservé — <strong>${tabSlot.label||'T.A.B.'}</strong> pour les matchs terminés à égalité (désigne le vainqueur uniquement, ne compte pas au classement)</div>
+            </div>`;
+          }
+        }
+        if(breaksAfter[s]){
+          block += breaksAfter[s].map(b=>`<div style="background:rgba(180,60,60,.08);border:1px dashed #b43c3c;border-radius:8px;padding:10px 14px;margin:4px 0">
+            <div style="font-family:'Oswald',sans-serif;font-size:22px;font-weight:700;color:#b43c3c;margin-bottom:2px">🕐 ${b.startTime} – ${b.endTime}</div>
+            <div style="font-size:12px">☕ <strong>${b.label}</strong> (${b.duration} min)</div>
+          </div>`).join('');
+        }
+        return block;
       }).join('');
-      const tabSlot = (ST.bracketTabSlots||[]).find(t=>t.round===ST.activeBracketRound);
-      if(tabSlot){
-        html += `<div style="background:var(--ylw-bg);border:1px dashed var(--ylw);border-radius:8px;padding:10px 14px;margin-top:4px">
-          <div style="font-family:'Oswald',sans-serif;font-size:22px;font-weight:700;color:var(--ylw);margin-bottom:2px">🕐 ${tabSlot.time}</div>
-          <div style="font-size:12px">⚽ Créneau réservé — <strong>T.A.B.</strong> pour les matchs de ce tour terminés à égalité (désigne le vainqueur uniquement)</div>
-        </div>`;
-      }
       listEl.innerHTML = html;
     }
   }
@@ -2360,6 +2554,19 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
   </div>
 
   <div class="card" style="margin-top:14px">
+    <div class="card-ttl">⚽ Tirs au but (T.A.B.)</div>
+    <div class="fr">
+      <div>
+        <label>Durée allouée à un créneau T.A.B. (min)</label>
+        <input type="number" id="cfg_tabdur" value="10" min="3" max="30" title="Durée allouée à un créneau de tirs au but" aria-label="Durée allouée à un créneau de tirs au but" oninput="onCfgChange()">
+      </div>
+    </div>
+    <div class="info info-y" style="font-size:12px;margin-top:6px">
+      Ces créneaux sont réservés en fin de phase de poules et après chaque tour de la phase finale, à utiliser uniquement en cas d'égalité parfaite. Les T.A.B. ne comptent jamais pour le classement — ils désignent seulement un vainqueur.
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
     <div class="card-ttl">🎲 Tirage des poules</div>
     <div class="fg">
       <div class="fr">
@@ -2585,7 +2792,7 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
       <li>Phase 1 : Formule championnat — 4 poules de 6 équipes.</li>
       <li>Phase Finale : Format à élimination directe selon le classement de la phase 1.</li>
     </ul>
-    <p>La ponctualité est impérative. Les équipes doivent se présenter au terrain désigné 4 minutes avant le début de leur match. En cas d'absence, sauf force majeure dûment constatée par l'organisation, l'équipe est déclarée forfait. Le match est perdu sur le score de 3-0.</p>
+    <p>La ponctualité est impérative. Les équipes doivent se présenter au terrain désigné 4 minutes avant le début de leur match. En cas d'absence, sauf force majeure dûment constatée par l'organisation, l'équipe est déclarée forfait. Le match est alors considéré comme perdu (voir Article 5 pour l'attribution des points).</p>
     <p>La durée des matches est gérée par la table de marque. L'arbitre central est seul juge du temps additionnel à accorder.</p>
   </div>
 
@@ -2611,7 +2818,7 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
       <li>Match gagné : 3 points</li>
       <li>Match nul : 1 point</li>
       <li>Match perdu : 0 point</li>
-      <li>Forfait : -1 point</li>
+      <li>Match perdu pour forfait : 0 point</li>
     </ul>
   </div>
 
