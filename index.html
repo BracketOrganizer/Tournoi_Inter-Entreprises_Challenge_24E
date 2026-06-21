@@ -600,13 +600,22 @@ window.buildPoolSchedule = function(){
 // ══════════════════════════════════════════════════════════
 function getPoolResult(matchId){
   const d = ST.results['pool-'+matchId];
-  if(!d) return { ga:'', gb:'' };
-  return { ga: d.ga??'', gb: d.gb??'' };
+  if(!d) return { ga:'', gb:'', shootout:null };
+  return { ga: d.ga??'', gb: d.gb??'', shootout: d.shootout||null };
 }
 window.setPoolResult = async function(matchId, ga, gb){
   if(!isScorer()) return;
   const key = 'pool-'+matchId;
-  const results = { ...ST.results, [key]: { ga, gb } };
+  const current = ST.results[key] || {};
+  const results = { ...ST.results, [key]: { ...current, ga, gb } };
+  ST.results = results;
+  await saveTournament({ results });
+};
+window.setPoolShootout = async function(matchId, shootout){
+  if(!isScorer()) return;
+  const key = 'pool-'+matchId;
+  const current = ST.results[key] || {};
+  const results = { ...ST.results, [key]: { ...current, shootout } };
   ST.results = results;
   await saveTournament({ results });
 };
@@ -630,8 +639,9 @@ function computePoolStandings(pool){
   });
   Object.values(stats).forEach(s=>s.diff=s.bp-s.bc);
 
-  // Tri : points > goal-average particulier > goal-average général > meilleure attaque
+  // Tri : points > goal-average particulier > goal-average général > meilleure attaque > T.A.B.
   const arr = Object.values(stats);
+  const tiedPairs = tiedPairsForPool(pool); // [{matchId,a,b}] — confrontations directes à départager
   arr.sort((a,b)=>{
     if(b.pts!==a.pts) return b.pts-a.pts;
     // Goal-average particulier (confrontation directe) — appliqué seulement si 2 équipes ex-aequo
@@ -649,7 +659,18 @@ function computePoolStandings(pool){
     }
     if(b.diff!==a.diff) return b.diff-a.diff;
     if(b.bp!==a.bp) return b.bp-a.bp;
-    return 0; // au-delà : tirs au but (geré manuellement par l'admin si nécessaire)
+    // Dernier recours (Article 6+8) : T.A.B. joué lors de leur confrontation
+    // directe en poule. Le vainqueur passe strictement devant le perdant.
+    const pair = tiedPairs.find(p=>(p.a===a.id&&p.b===b.id)||(p.a===b.id&&p.b===a.id));
+    if(pair){
+      const r = getPoolResult(pair.matchId);
+      if(r.shootout && r.shootout.ga!=null && r.shootout.gb!=null){
+        const aIsPairA = pair.a===a.id;
+        const soDiff = aIsPairA ? (r.shootout.ga-r.shootout.gb) : (r.shootout.gb-r.shootout.ga);
+        if(soDiff!==0) return -soDiff;
+      }
+    }
+    return 0; // T.A.B. non encore joué/saisi : égalité maintenue en attendant
   });
   return arr;
 }
@@ -659,23 +680,81 @@ function allPoolStandings(){
   return out;
 }
 
-// ── T.A.B. de poule (créneau réservé, informatif) ────────
-// Stocké sous results['pool-tab-{pool}'] = { teamA, teamB, ga, gb }.
-// L'admin/scorer choisit librement les 2 équipes concernées (l'égalité peut
-// survenir à n'importe quel rang du classement), saisit les buts au T.A.B.
-// Ne compte jamais au classement — désigne juste un vainqueur informatif.
-function getPoolTabResult(pool){
-  const d = ST.results['pool-tab-'+pool];
-  return d || { teamA:'', teamB:'', ga:'', gb:'' };
+// ── T.A.B. de poule — déclenchement automatique sur égalité parfaite ────
+// Après tri par points > GA particulier > GA général > meilleure attaque
+// (Article 6 du règlement), si 2+ équipes restent EXACTEMENT à égalité sur
+// ces 4 critères, on retrouve leur(s) match(s) direct(s) déjà joué(s) en
+// poule et on y rattache un T.A.B. (même mécanisme que la phase finale :
+// champ `shootout` sur le résultat du match). Le vainqueur du T.A.B. est
+// classé strictement au-dessus du perdant — indépendamment des autres
+// paires éventuellement concernées (cas à 3+ équipes à égalité).
+function findTiedGroups(pool){
+  const ids = ST.pools[pool]||[];
+  if(ids.length<2) return [];
+  const matches = ST.poolSchedule.filter(m=>m.pool===pool);
+  // Vérifie que tous les matchs de la poule sont joués : un groupe d'égalité
+  // n'a de sens qu'une fois le classement définitif (sinon un futur résultat
+  // pourrait encore changer la donne).
+  const allPlayed = matches.every(m=>{ const r=getPoolResult(m.matchId); return r.ga!==''&&r.gb!==''; });
+  if(!allPlayed) return [];
+
+  const stats = {};
+  ids.forEach(id=>stats[id]={ id, pts:0, bp:0, bc:0, diff:0 });
+  matches.forEach(m=>{
+    const r=getPoolResult(m.matchId);
+    const ga=+r.ga, gb=+r.gb;
+    const sa=stats[m.a], sb=stats[m.b]; if(!sa||!sb) return;
+    sa.bp+=ga; sa.bc+=gb; sb.bp+=gb; sb.bc+=ga;
+    if(ga>gb) sa.pts+=3; else if(ga<gb) sb.pts+=3; else { sa.pts+=1; sb.pts+=1; }
+  });
+  Object.values(stats).forEach(s=>s.diff=s.bp-s.bc);
+
+  // Regroupe par (pts, diff, bp) strictement identiques — c'est ce qui reste
+  // après les 3 premiers critères de l'Article 6 (le GA particulier ne
+  // permet de différencier que les paires exactes, pas les groupes de 3+).
+  const groups = {};
+  Object.values(stats).forEach(s=>{
+    const key = s.pts+'_'+s.diff+'_'+s.bp;
+    (groups[key]=groups[key]||[]).push(s.id);
+  });
+  return Object.values(groups).filter(g=>g.length>=2);
 }
-window.savePoolTab = async function(pool, patch){
-  if(!isScorer()) return;
-  const key = 'pool-tab-'+pool;
-  const current = getPoolTabResult(pool);
-  const results = { ...ST.results, [key]: { ...current, ...patch } };
-  ST.results = results;
-  await saveTournament({ results });
-};
+
+// Pour un groupe d'équipes à égalité, retrouve les paires consécutives à
+// départager par T.A.B. : si 2 équipes → 1 paire ; si 3+ équipes → toutes les
+// confrontations directes déjà jouées entre elles, dans l'ordre chronologique
+// du calendrier de poule (1er match joué entre 2 équipes du groupe = 1er T.A.B.).
+// Retourne aussi les groupes bruts (pour affichage "par groupe d'égalité").
+function tiedPairsForPool(pool){
+  const groups = findTiedGroups(pool);
+  if(!groups.length) return [];
+  const matches = ST.poolSchedule.filter(m=>m.pool===pool).slice().sort((a,b)=>a.slot-b.slot);
+  const pairs=[];
+  groups.forEach(group=>{
+    matches.forEach(m=>{
+      if(group.includes(m.a) && group.includes(m.b)){
+        pairs.push({ matchId:m.matchId, a:m.a, b:m.b, group });
+      }
+    });
+  });
+  return pairs; // [{matchId, a, b, group:[...]}, ...] — un par confrontation directe entre équipes à égalité
+}
+// Variante groupée : [{group:[...ids], pairs:[{matchId,a,b}]}] — pratique pour
+// l'affichage "par groupe d'égalité" (récapitulatif du créneau T.A.B.).
+function tiedGroupsWithPairsForPool(pool){
+  const groups = findTiedGroups(pool);
+  if(!groups.length) return [];
+  const matches = ST.poolSchedule.filter(m=>m.pool===pool).slice().sort((a,b)=>a.slot-b.slot);
+  return groups.map(group=>({
+    group,
+    pairs: matches.filter(m=>group.includes(m.a) && group.includes(m.b)).map(m=>({ matchId:m.matchId, a:m.a, b:m.b }))
+  }));
+}
+
+// Vrai si CE match précis de poule fait partie d'une paire à départager par T.A.B.
+function poolMatchNeedsShootout(matchId, pool){
+  return tiedPairsForPool(pool).some(p=>p.matchId===matchId);
+}
 
 function poolRankTeam(pool, rank){
   const st = computePoolStandings(pool);
@@ -1668,7 +1747,7 @@ function renderPoolsView(){
 
   const listEl = document.getElementById('poolMatchList');
   if(ST.activePoolRound===TAB_SLOT_KEY){
-    if(listEl) listEl.innerHTML = poolTabFormHTML();
+    if(listEl) listEl.innerHTML = poolTabSummaryHTML();
     renderPoolStandingsPanel();
     return;
   }
@@ -1677,7 +1756,8 @@ function renderPoolsView(){
   if(listEl){
     let html = matches.map(m=>{
       const r=getPoolResult(m.matchId);
-      return matchCardHTML('pool', m.matchId, m.a, m.b, r, `Poule ${m.pool}`, m.court, m.time);
+      const needsShootout = poolMatchNeedsShootout(m.matchId, m.pool);
+      return matchCardHTML('pool', m.matchId, m.a, m.b, r, `Poule ${m.pool}`, m.court, m.time, needsShootout);
     }).join('');
     const breaksAfter = (ST.poolBreaks||[]).filter(b=>b.afterSlot===ST.activePoolRound);
     breaksAfter.forEach(b=>{
@@ -1693,54 +1773,37 @@ function renderPoolsView(){
 }
 window.setPoolSlot = function(s){ ST.activePoolRound=s; renderPoolsView(); };
 
-// Formulaire de saisie du T.A.B. de poule : 2 équipes choisies librement
-// (l'égalité peut survenir à n'importe quel rang/poule) + 2 petits champs de
-// score pour désigner le vainqueur. Une ligne par poule (A,B,C,D), au cas où
-// plusieurs poules ont besoin d'un T.A.B. sur ce même créneau réservé.
-function poolTabFormHTML(){
-  const canEdit = isScorer();
-  return `<div class="info info-y" style="margin-bottom:10px">
-      ⚽ Créneau réservé aux T.A.B. en cas d'égalité parfaite au classement d'une poule. Choisissez les 2 équipes concernées et saisissez le résultat. Ne compte pas pour le classement — désigne seulement un vainqueur.
-    </div>` +
-    ['A','B','C','D'].map(p=>{
-      const teams = ST.pools[p]||[];
-      const tab = getPoolTabResult(p);
-      const done = tab.ga!==''&&tab.gb!=='';
-      return `<div style="background:var(--s1);border:1px solid var(--bdr);border-radius:10px;padding:12px 14px;margin-bottom:8px">
-        <div style="font-size:11px;color:var(--dim);margin-bottom:6px">Poule ${p}</div>
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-          ${canEdit?`
-            <select id="tab_teamA_${p}" style="flex:1;min-width:120px" onchange="savePoolTab('${p}',{teamA:this.value})">
-              <option value="">— Équipe 1 —</option>
-              ${teams.map(t=>`<option value="${t}" ${tab.teamA===t?'selected':''}>${tName(t)}</option>`).join('')}
-            </select>
-            <input type="number" min="0" max="20" value="${tab.ga}" style="width:42px;text-align:center" id="tab_ga_${p}" title="Buts équipe 1" aria-label="Buts équipe 1" onfocus="this.select()" oninput="scheduleAutoSavePoolTab('${p}')">
-            <span>–</span>
-            <input type="number" min="0" max="20" value="${tab.gb}" style="width:42px;text-align:center" id="tab_gb_${p}" title="Buts équipe 2" aria-label="Buts équipe 2" onfocus="this.select()" oninput="scheduleAutoSavePoolTab('${p}')">
-            <select id="tab_teamB_${p}" style="flex:1;min-width:120px" onchange="savePoolTab('${p}',{teamB:this.value})">
-              <option value="">— Équipe 2 —</option>
-              ${teams.map(t=>`<option value="${t}" ${tab.teamB===t?'selected':''}>${tName(t)}</option>`).join('')}
-            </select>
-          `:`<div style="font-size:13px">${tab.teamA?tName(tab.teamA):'—'} ${done?`<strong>${tab.ga} – ${tab.gb}</strong>`:'vs'} ${tab.teamB?tName(tab.teamB):'—'}</div>`}
-          <span id="tab_status_${p}" style="font-size:10px;color:var(--muted)">${done?'✓ Enregistré':''}</span>
-        </div>
-      </div>`;
-    }).join('');
+// Récapitulatif du créneau "T.A.B. possible" : liste, pour chaque poule, les
+// confrontations directes qui doivent être départagées par T.A.B. (égalité
+// parfaite détectée automatiquement), avec un lien direct vers le créneau du
+// match concerné pour y saisir le résultat — la saisie se fait là où le match
+// a été joué, pas dans un formulaire séparé.
+function poolTabSummaryHTML(){
+  let any=false;
+  const html = ['A','B','C','D'].map(p=>{
+    const groupsWithPairs = tiedGroupsWithPairsForPool(p);
+    if(!groupsWithPairs.length) return '';
+    any=true;
+    return `<div style="background:var(--s1);border:1px solid var(--ylw);border-radius:10px;padding:12px 14px;margin-bottom:8px">
+      <div style="font-size:11px;color:var(--dim);margin-bottom:8px">Poule ${p}</div>
+      ${groupsWithPairs.map(({group,pairs})=>`
+        <div style="margin-bottom:10px;padding:8px 10px;background:var(--s2);border-radius:8px">
+          <div style="font-size:12px;font-weight:700;color:var(--ylw);margin-bottom:6px">⚖️ Égalité parfaite : ${group.map(tName).join(' · ')}</div>
+          ${pairs.map(pair=>{
+            const r=getPoolResult(pair.matchId);
+            const m = ST.poolSchedule.find(x=>x.matchId===pair.matchId);
+            const done = r.shootout && r.shootout.ga!=null;
+            return `<div style="font-size:13px;display:flex;justify-content:space-between;align-items:center;gap:8px;padding:3px 0">
+              <span>${tName(pair.a)} – ${tName(pair.b)} ${done?`<strong style="color:var(--grn)">T.A.B. ${r.shootout.ga}-${r.shootout.gb}</strong>`:'<span style="color:var(--ylw)">⚽ T.A.B. à saisir</span>'}</span>
+              ${m?`<button class="btn btn-ghost btn-xs" onclick="setPoolSlot(${m.slot})">Aller au match (Créneau ${m.slot+1})</button>`:''}
+            </div>`;
+          }).join('')}
+        </div>`).join('')}
+    </div>`;
+  }).join('');
+  if(!any) return '<div class="info info-b">Aucune égalité parfaite détectée pour le moment (le classement de chaque poule doit être complet pour que la détection s\'active).</div>';
+  return html;
 }
-const _poolTabDebounce = {};
-window.scheduleAutoSavePoolTab = function(pool){
-  clearTimeout(_poolTabDebounce[pool]);
-  const statusEl = document.getElementById(`tab_status_${pool}`);
-  if(statusEl) statusEl.textContent='…';
-  _poolTabDebounce[pool] = setTimeout(async ()=>{
-    const gaEl=document.getElementById(`tab_ga_${pool}`), gbEl=document.getElementById(`tab_gb_${pool}`);
-    if(!gaEl||!gbEl) return;
-    const ga=gaEl.value, gb=gbEl.value;
-    if(ga===''||gb===''){ if(statusEl) statusEl.textContent=''; return; }
-    await savePoolTab(pool, { ga:+ga, gb:+gb });
-    if(statusEl) statusEl.textContent='✓ Enregistré';
-  }, 800);
-};
 
 const POOL_COLORS = {
   A: { main:'#2f6fed', bg:'rgba(47,111,237,.10)' },   // bleu
@@ -1925,8 +1988,11 @@ window.scheduleAutoSaveShootout = function(type, matchId){
     const ga=aEl.value, gb=bEl.value;
     if(ga===''||gb===''){ if(statusEl) statusEl.textContent=''; return; }
     if(+ga===+gb){ if(statusEl){ statusEl.textContent='⚠ Il faut un vainqueur (scores différents)'; statusEl.style.color='var(--red)'; } return; }
-    const r = getBracketResult(matchId);
-    await setBracketResult(matchId, r.ga, r.gb, { ga:+ga, gb:+gb });
+    if(type==='pool') await setPoolShootout(matchId, { ga:+ga, gb:+gb });
+    else {
+      const r = getBracketResult(matchId);
+      await setBracketResult(matchId, r.ga, r.gb, { ga:+ga, gb:+gb });
+    }
     if(statusEl){ statusEl.style.color='var(--muted)'; statusEl.textContent='✓ Enregistré'; }
     refreshCurrentPage();
   }, 800);
