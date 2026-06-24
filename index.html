@@ -1097,18 +1097,17 @@ window.generateBracket = function(){
     slotDurations.push(matchSlotDur); slotIdx++;
   }
 
-  // ── Tour 3, Bloc C : 7-8e + 5-6e en même temps (M33, M34) ──
-  for(let i=0;i<round3BlockC.length;i+=courts){
-    const slot = round3BlockC.slice(i,i+courts);
-    slot.forEach((b,ci)=>{ rawSchedule.push({ m:b.m, round:3, court:ci+1, slot:slotIdx, label:b.label||null }); });
-    slotDurations.push(matchSlotDur); slotIdx++;
-  }
-
-  // ── Tour 3, M35 : 3e-4e place ──
-  rawSchedule.push({ m:35, round:3, court:1, slot:slotIdx, label:round3M35.label||null });
+  // ── Tour 3, Bloc C : 7-8e (M33), 5-6e (M34), 3-4e (M35) en MÊME TEMPS
+  //    sur les terrains B(2), C(3), D(4) — même créneau simultané.
+  //    Puis la Finale 1-2e (M36) SEULE sur le terrain A(1) après.
+  const podiumSlotIdx = slotIdx;
+  [33, 34, 35].forEach((mNum, ci) => {
+    const b = BRACKET_BY_NUM[mNum];
+    rawSchedule.push({ m:mNum, round:3, court:ci+2, slot:podiumSlotIdx, label:b.label||null }); // terrains 2,3,4
+  });
   slotDurations.push(matchSlotDur); slotIdx++;
 
-  // ── Tour 3, M36 : Finale 1-2e place (seule) ──
+  // ── Tour 3, M36 : Finale 1-2e place, SEULE sur le terrain A (terrain 1) ──
   rawSchedule.push({ m:36, round:3, court:1, slot:slotIdx, label:round3M36.label||null });
   slotDurations.push(matchSlotDur); slotIdx++;
 
