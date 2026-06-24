@@ -14,7 +14,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#0f4a1f">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚽</text></svg>">
-<title>⚽ Foot Entreprises Challenge</title>
+<title>⚽ Challenge Inter-Entreprises</title>
 <link href="https://fonts.googleapis.com/css2?family=Exo+2:wght@300;400;600;700;900&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
 
 <!-- ══════════════════════════════════════════════════════════
@@ -30,16 +30,26 @@ import { getFirestore, doc, getDoc, getDocs, setDoc, deleteDoc, onSnapshot, coll
                                     from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
 
 const firebaseConfig = {
-  apiKey: "AIzaSyCjyPfCjKvSVFUp8dyF0bjbXwuDIukGu2c",
-  authDomain: "tournoi-foot-inter-entreprises.firebaseapp.com",
-  projectId: "tournoi-foot-inter-entreprises",
-  storageBucket: "tournoi-foot-inter-entreprises.firebasestorage.app",
-  messagingSenderId: "995068678625",
-  appId: "1:995068678625:web:cbe198e586f4e928f802a0",
-  measurementId: "G-D6ZFZR3XJN"
+  // ⚠️ Remplacez ces valeurs par celles de votre nouveau projet Firebase
+  // Console Firebase → Paramètres du projet → Vos applications → SDK Firebase
+  apiKey: "VOTRE_API_KEY",
+  authDomain: "VOTRE_PROJECT.firebaseapp.com",
+  projectId: "VOTRE_PROJECT_ID",
+  storageBucket: "VOTRE_PROJECT.firebasestorage.app",
+  messagingSenderId: "VOTRE_SENDER_ID",
+  appId: "VOTRE_APP_ID"
 };
-// ⚠️ Remplacez les valeurs ci-dessus par celles de VOTRE projet Firebase
-// (créez un nouveau projet Firebase dédié à ce tournoi de foot, distinct du pickleball)
+// ⚠️ Remplacez les valeurs ci-dessus par celles de VOTRE projet Firebase.
+// Cette appli réutilise les MÊMES collections Firestore (foottournoi,
+// teamRosters, tag 'foot24') propre à cette application, pour
+// rester compatible avec vos règles de sécurité Firestore existantes sans
+// rien avoir à modifier dans la Console Firebase.
+// ⚠️ IMPORTANT : les deux tournois partagent donc le même document
+// 'foottournoi/current'. Ne faites JAMAIS tourner les deux applis en même
+// temps (saisie de scores, etc.) sous peine d'écraser les données de l'une
+// avec celles de l'autre. Si vous avez besoin d'une vraie séparation (les
+// deux événements en simultané), créez un second projet Firebase dédié et
+// mettez à jour ses règles de sécurité en conséquence — demandez-moi si besoin.
 
 const app       = initializeApp(firebaseConfig);
 const auth      = getAuth(app);
@@ -47,7 +57,7 @@ const db        = getFirestore(app);
 const gProvider = new GoogleAuthProvider();
 
 // ══════════════════════════════════════════════════════════
-// ÉTAT GLOBAL — Foot Entreprises (24 équipes, 4 poules de 6)
+// ÉTAT GLOBAL — Challenge Inter-Entreprises (24 équipes, 4 poules de 6)
 // Rôles : 'admin' | 'scorer' | 'spectator'
 // ══════════════════════════════════════════════════════════
 let CURRENT_USER = null;
@@ -58,8 +68,8 @@ let unsubRoster = null;
 
 const ST = {
   page:1, prevPage:1, rulesOpen:false,
-  teams:[],        // [{id,name,club,licence,lv}]  -- 24 équipes d'entreprises
-  pools:{A:[],B:[],C:[],D:[]}, // ids d'équipes par poule
+  teams:[],        // [{id,name,club,lv,respNom,respTel}]  -- 24 équipes inter-entreprises
+  pools:{A:[],B:[],C:[],D:[]}, // ids d'équipes par poule (6 équipes par poule)
   poolSchedule:[], // matchs de phase de poules [{m,pool,a,b,time,court}]
   poolTabSlot:null,    // créneau "TAB possible" réservé en fin de phase de poules {time,slot}
   poolBreaks:[],        // coupures réellement insérées pendant les poules [{afterSlot,startTime,endTime,label,duration}]
@@ -75,15 +85,12 @@ const ST = {
   timerSec:0, timerRun:false, timerMode:'match', timerIv:null,
   cfg:{
     n:24,
-    courts:4,            // nombre de terrains
-    matchDur:12,          // durée match (min) - poules
+    courts:6,            // nombre de terrains (6 pour 24 équipes)
+    matchDur:10,          // durée match (min) - poules
     matchDurBracket:12,   // durée match phase finale (min)
-    tt:4,                 // transition entre matchs (min)
+    tt:3,                 // transition entre matchs (min)
     start:'09:00',
-    // Coupures multiples (déjeuner, pauses...) : chacune démarre à la fin du
-    // créneau en cours le plus proche de l'heure visée (jamais en plein milieu
-    // d'un créneau), peu importe qu'on soit en phase de poules ou en finale.
-    breaks:[ { time:'12:00', duration:45, label:'Pause déjeuner' } ],
+    breaks:[ { time:'12:30', duration:60, label:'Pause déjeuner' } ],
     tabDuration:10,        // durée allouée à un créneau T.A.B. (minutes), réglable
     draw:'order'           // 'order' | 'random' | 'random-no-club'
   }
@@ -178,55 +185,72 @@ function appliedBreaksFromSchedule(existingTimes, breaks){
 }
 // ══════════════════════════════════════════════════════════
 // ARBRE PHASE FINALE — 24 équipes, 4 poules de 6 (A,B,C,D)
-// Format exact selon le règlement officiel.
+// Format : 3 tours, 12 matchs par tour = 36 matchs au total
+// Classement complet de la 1ère à la 24ème place.
+//
+// TOUR 1 (M1-M12) : croisements entre poules par rang (1-6)
+//   - Tableau 5-6 : rangs 5 et 6 de chaque poule (8 équipes → 4 matchs)
+//   - Tableau 3-4 : rangs 3 et 4 de chaque poule (8 équipes → 4 matchs)
+//   - Tableau 1-2 : rangs 1 et 2 de chaque poule (8 équipes → 4 matchs)
+// TOUR 2 (M13-M24) : Vainqueurs / Perdants du tour 1
+// TOUR 3 (M25-M36) : classement final 1 à 24
 // ══════════════════════════════════════════════════════════
 
-// TOUR 1 (M1-M12) : croisements entre poules par rang de classement
+// TOUR 1 (M1-M12)
 const BRACKET_ROUND1 = [
+  // Tableau 5-6 (places 17-24) : rangs 5 et 6 croisés entre poules
   { m:1,  a:{rank:5,pool:'A'}, b:{rank:6,pool:'C'} },
   { m:2,  a:{rank:5,pool:'B'}, b:{rank:6,pool:'D'} },
-  { m:3,  a:{rank:5,pool:'C'}, b:{rank:6,pool:'B'} },
-  { m:4,  a:{rank:5,pool:'D'}, b:{rank:6,pool:'A'} },
+  { m:3,  a:{rank:5,pool:'C'}, b:{rank:6,pool:'A'} },
+  { m:4,  a:{rank:5,pool:'D'}, b:{rank:6,pool:'B'} },
+  // Tableau 3-4 (places 9-16) : rangs 3 et 4 croisés entre poules
   { m:5,  a:{rank:3,pool:'A'}, b:{rank:4,pool:'C'} },
   { m:6,  a:{rank:3,pool:'B'}, b:{rank:4,pool:'D'} },
-  { m:7,  a:{rank:3,pool:'C'}, b:{rank:4,pool:'B'} },
-  { m:8,  a:{rank:3,pool:'D'}, b:{rank:4,pool:'A'} },
+  { m:7,  a:{rank:3,pool:'C'}, b:{rank:4,pool:'A'} },
+  { m:8,  a:{rank:3,pool:'D'}, b:{rank:4,pool:'B'} },
+  // Tableau 1-2 (places 1-8) : rangs 1 et 2 croisés entre poules
   { m:9,  a:{rank:1,pool:'A'}, b:{rank:2,pool:'C'} },
   { m:10, a:{rank:1,pool:'B'}, b:{rank:2,pool:'D'} },
-  { m:11, a:{rank:1,pool:'C'}, b:{rank:2,pool:'B'} },
-  { m:12, a:{rank:1,pool:'D'}, b:{rank:2,pool:'A'} },
+  { m:11, a:{rank:1,pool:'C'}, b:{rank:2,pool:'A'} },
+  { m:12, a:{rank:1,pool:'D'}, b:{rank:2,pool:'B'} },
 ];
 
-// TOUR 2 (M13-M24) : Vainqueurs / Perdants du tour 1
+// TOUR 2 (M13-M24)
 const BRACKET_ROUND2 = [
-  { m:13, a:{from:'V',m:1},  b:{from:'V',m:2} },
-  { m:14, a:{from:'V',m:3},  b:{from:'V',m:4} },
-  { m:15, a:{from:'P',m:1},  b:{from:'P',m:2} },
-  { m:16, a:{from:'P',m:3},  b:{from:'P',m:4} },
-  { m:17, a:{from:'V',m:5},  b:{from:'V',m:6} },
-  { m:18, a:{from:'V',m:7},  b:{from:'V',m:8} },
-  { m:19, a:{from:'P',m:5},  b:{from:'P',m:6} },
-  { m:20, a:{from:'P',m:7},  b:{from:'P',m:8} },
+  // Tableau 5-6
+  { m:13, a:{from:'V',m:1}, b:{from:'V',m:2} },
+  { m:14, a:{from:'V',m:3}, b:{from:'V',m:4} },
+  { m:15, a:{from:'P',m:1}, b:{from:'P',m:2} },
+  { m:16, a:{from:'P',m:3}, b:{from:'P',m:4} },
+  // Tableau 3-4
+  { m:17, a:{from:'V',m:5}, b:{from:'V',m:6} },
+  { m:18, a:{from:'V',m:7}, b:{from:'V',m:8} },
+  { m:19, a:{from:'P',m:5}, b:{from:'P',m:6} },
+  { m:20, a:{from:'P',m:7}, b:{from:'P',m:8} },
+  // Tableau 1-2
   { m:21, a:{from:'V',m:9},  b:{from:'V',m:10} },
   { m:22, a:{from:'V',m:11}, b:{from:'V',m:12} },
   { m:23, a:{from:'P',m:9},  b:{from:'P',m:10} },
   { m:24, a:{from:'P',m:11}, b:{from:'P',m:12} },
 ];
 
-// TOUR 3 (M25-M36) : classement final, places 1 à 24
+// TOUR 3 (M25-M36) : classement final 1 à 24
 const BRACKET_ROUND3 = [
+  // Tableau 5-6 : places 17-24
   { m:25, label:'23e - 24e place', a:{from:'P',m:15}, b:{from:'P',m:16} },
   { m:26, label:'21e - 22e place', a:{from:'V',m:15}, b:{from:'V',m:16} },
   { m:27, label:'19e - 20e place', a:{from:'P',m:13}, b:{from:'P',m:14} },
   { m:28, label:'17e - 18e place', a:{from:'V',m:13}, b:{from:'V',m:14} },
+  // Tableau 3-4 : places 9-16
   { m:29, label:'15e - 16e place', a:{from:'P',m:19}, b:{from:'P',m:20} },
   { m:30, label:'13e - 14e place', a:{from:'V',m:19}, b:{from:'V',m:20} },
   { m:31, label:'11e - 12e place', a:{from:'P',m:17}, b:{from:'P',m:18} },
   { m:32, label:'9e - 10e place',  a:{from:'V',m:17}, b:{from:'V',m:18} },
+  // Tableau 1-2 : places 1-8
   { m:33, label:'7e - 8e place',   a:{from:'P',m:23}, b:{from:'P',m:24} },
   { m:34, label:'5e - 6e place',   a:{from:'V',m:23}, b:{from:'V',m:24} },
   { m:35, label:'3e - 4e place',   a:{from:'P',m:21}, b:{from:'P',m:22} },
-  { m:36, label:'Finale (1ere - 2e place)', a:{from:'V',m:21}, b:{from:'V',m:22} },
+  { m:36, label:'Finale (1ère - 2e place)', a:{from:'V',m:21}, b:{from:'V',m:22} },
 ];
 
 const BRACKET_ALL = [...BRACKET_ROUND1, ...BRACKET_ROUND2, ...BRACKET_ROUND3];
@@ -242,11 +266,28 @@ function bracketLabel(m){
 // ══════════════════════════════════════════════════════════
 // AUTH
 // ══════════════════════════════════════════════════════════
-async function getUserProfile(uid){
+// Comptes admin reconnus en dur — DOIT rester identique à la liste codée
+// dans isAdmin() des règles Firestore (firestore.rules). Sans ce miroir,
+// un compte Google admin légitime (autorisé à écrire côté Firestore) se
+// retrouvait quand même affiché en spectateur côté client si son document
+// users/{uid} n'avait pas explicitement role:'admin'.
+const HARDCODED_ADMIN_EMAILS = ['checheux@gmail.com', 'bracket.organizer@gmail.com'];
+
+async function getUserProfile(uid, email){
+  if(email && HARDCODED_ADMIN_EMAILS.includes(email)){
+    return { role:'admin', teamId:null };
+  }
   try {
     const snap = await getDoc(doc(db,'users',uid));
     if(snap.exists()){
       const d = snap.data();
+      // Un compte 'manager' n'est valide ICI que s'il a été créé pour CE
+      // tournoi (tournament === 'foot24'). Un manager d'une autre app
+      // (même projet Firebase, même collection 'users') doit être traité
+      // comme un simple spectateur sur cette app.
+      if(d.role==='manager' && d.tournament!=='foot24'){
+        return { role:'spectator', teamId:null };
+      }
       return { role: d.role || 'spectator', teamId: d.teamId || null };
     }
     return { role:'spectator', teamId:null }; // doc inexistant = nouvel utilisateur, rôle par défaut
@@ -264,7 +305,7 @@ async function ensureUserDoc(user){
       await setDoc(ref,{
         email: user.email,
         name:  user.displayName || user.email.split('@')[0],
-        role:  'spectator',
+        role:  HARDCODED_ADMIN_EMAILS.includes(user.email) ? 'admin' : 'spectator',
         createdAt: serverTimestamp()
       });
     }
@@ -278,14 +319,14 @@ onAuthStateChanged(auth, async (user)=>{
   if(user){
     CURRENT_USER = user;
     await ensureUserDoc(user);
-    const profile = await getUserProfile(user.uid);
+    const profile = await getUserProfile(user.uid, user.email);
     USER_ROLE = profile.role;
     MANAGER_TEAM_ID = profile.teamId;
     if(USER_ROLE === 'spectator'){
-      try {
-        const snap = await getDoc(doc(db,'foottournoi','current'));
-        ST.liveOpen = snap.exists() ? snap.data().liveOpen === true : false;
-      } catch(e){ ST.liveOpen = false; }
+      // ST.liveOpen est déjà tenu à jour en continu par startLiveWatch
+      // (actif depuis le chargement de la page), pas besoin d'un nouveau
+      // getDoc ici — ça évite une lecture redondante et un état désynchronisé
+      // entre les deux sources.
       if(!ST.liveOpen){
         await signOut(auth);
         CURRENT_USER = null; USER_ROLE = null; MANAGER_TEAM_ID = null;
@@ -299,11 +340,7 @@ onAuthStateChanged(auth, async (user)=>{
     if(USER_ROLE === 'manager' && MANAGER_TEAM_ID) subscribeToRoster(MANAGER_TEAM_ID);
   } else {
     CURRENT_USER = null; USER_ROLE = null; MANAGER_TEAM_ID = null;
-    unsubAll();
-    try {
-      const snap = await getDoc(doc(db,'foottournoi','current'));
-      if(snap.exists()) ST.liveOpen = snap.data().liveOpen === true;
-    } catch(e){}
+    unsubAll(); // relance startLiveWatch() : ST.liveOpen reste à jour en continu
     showLogin();
   }
 });
@@ -311,6 +348,8 @@ onAuthStateChanged(auth, async (user)=>{
 function unsubAll(){
   if(unsubTournament){ unsubTournament(); unsubTournament=null; }
   if(unsubRoster){ unsubRoster(); unsubRoster=null; }
+  stopLiveWatch(); // coupe listener + polling
+  startLiveWatch(); // ré-arme pour l'écran de login
 }
 
 window.loginEmail = async function(){
@@ -347,12 +386,22 @@ function showAuthMsg(msg,color){
   el.textContent=msg; el.style.color = color==='red' ? 'var(--red)' : 'var(--grn)';
 }
 
-window.enterLiveModeAndGo = function(target){
+let pendingSpecTarget = null; // cible demandée par un visiteur en attente que le live s'ouvre
+
+window.enterLiveModeAndGo = async function(target){
+  // Même logique que spectatorGoLive : relecture fraîche avant de vérifier
+  // liveOpen, pour ne pas rester bloqué sur un état périmé (listener lent).
+  try {
+    const snap = await getDoc(doc(db,'foottournoi','current'));
+    if(snap.exists()) handleLiveOpenChange(snap.data().liveOpen === true);
+  } catch(e){ console.warn('enterLiveModeAndGo: relecture liveOpen échouée', e); }
   if(target !== 'R' && !ST.liveOpen){
+    pendingSpecTarget = target;
     const overlay = document.getElementById('liveClosedOverlay');
     if(overlay) overlay.style.display='flex';
     return;
   }
+  pendingSpecTarget = null;
   USER_ROLE = 'spectator';
   document.getElementById('loginScreen').style.display = 'none';
   document.getElementById('appScreen').style.display = '';
@@ -361,15 +410,120 @@ window.enterLiveModeAndGo = function(target){
   const stepNav = document.getElementById('stepNav');
   if(stepNav) stepNav.style.display = 'none';
   applyRoleUI();
+  // Visiteur sans compte : on s'assure que les mises à jour du tournoi
+  // (scores, planning, liveOpen) arrivent bien en direct, comme pour un
+  // spectateur connecté. Sans ça, l'écran ne bougeait plus jusqu'au
+  // rechargement manuel de la page (cause du désync constaté entre
+  // appareils : chacun restait figé sur l'état lu à son propre chargement).
+  if(!CURRENT_USER) subscribeToTournament();
   if(target === 'R'){ toggleRules(); }
   else if(target === 'T'){ goTo('T'); }
   else { goTo(target); }
 };
 
 // ══════════════════════════════════════════════════════════
+// SUIVI LIVE GLOBAL — détecte le passage liveOpen:false -> true et, si un
+// visiteur attendait sur l'overlay "live fermé" (cible mémorisée dans
+// pendingSpecTarget), l'embarque automatiquement vers la page demandée.
+// Appelée depuis startLiveWatch (écran de login) ET depuis
+// subscribeToTournament (une fois déjà dans l'app), pour que ça marche
+// quel que soit l'endroit où l'utilisateur se trouve quand l'admin ouvre
+// le live.
+// ══════════════════════════════════════════════════════════
+function handleLiveOpenChange(nowOpen){
+  const wasOpen = ST.liveOpen;
+  ST.liveOpen = nowOpen;
+  updateLiveToggleBtn(); // reflète le nouvel état sur le bouton du panneau admin, sur tous les appareils
+
+  // ── Fermeture du live : renvoyer les spectateurs sur l'overlay ──────────
+  // Si le live passe de ouvert à fermé ET que l'utilisateur courant est un
+  // spectateur (ou visiteur sans compte), on affiche l'overlay "live fermé"
+  // par-dessus l'app. Les admins/scorers/managers ne sont pas affectés.
+  if(wasOpen && !ST.liveOpen){
+    const appScreen = document.getElementById('appScreen');
+    const isInApp = appScreen && appScreen.style.display !== 'none';
+    if(isInApp && (USER_ROLE === 'spectator' || USER_ROLE === null)){
+      const overlay = document.getElementById('liveClosedOverlay');
+      if(overlay) overlay.style.display = 'flex';
+      pendingSpecTarget = typeof ST.page === 'number' ? ST.page : 4; // mémorise pour ré-ouvrir au même endroit
+    }
+    return;
+  }
+
+  // ── Ouverture du live : débloquer un spectateur en attente ──────────────
+  if(!wasOpen && ST.liveOpen && pendingSpecTarget !== null){
+    const overlay = document.getElementById('liveClosedOverlay');
+    if(overlay) overlay.style.display = 'none';
+    const target = pendingSpecTarget;
+    pendingSpecTarget = null;
+    if(USER_ROLE === 'spectator'){
+      // Déjà dans l'app (overlay déclenché via spectatorGoLive) : on navigue simplement.
+      if(target === 'R') toggleRules();
+      else goTo(target === 'T' ? 'T' : target);
+    } else {
+      // Encore sur l'écran de login (overlay déclenché via enterLiveModeAndGo).
+      enterLiveModeAndGo(target);
+    }
+  }
+}
+
+let unsubLiveWatch = null;
+let liveWatchIv = null; // polling de secours (mobile en veille)
+
+function startLiveWatch(){
+  if(unsubLiveWatch) return; // déjà actif
+  // Listener temps réel sur foottournoi/status (toujours lisible publiquement).
+  unsubLiveWatch = onSnapshot(doc(db,'foottournoi','status'), (snap)=>{
+    if(!snap.exists()) return;
+    handleLiveOpenChange(snap.data().liveOpen === true);
+  }, (e)=>{ console.warn('startLiveWatch', e); });
+
+  // Polling de secours toutes les 4 secondes : sur mobile, le navigateur peut
+  // suspendre le WebSocket Firestore sans déclencher visibilitychange. Le
+  // polling garantit que la fermeture/ouverture du live est détectée même dans
+  // ce cas, sans attendre que l'utilisateur touche l'écran.
+  if(!liveWatchIv){
+    liveWatchIv = setInterval(async ()=>{
+      try {
+        const snap = await getDoc(doc(db,'foottournoi','status'));
+        if(snap.exists()) handleLiveOpenChange(snap.data().liveOpen === true);
+      } catch(e){ /* silencieux : réseau indisponible */ }
+    }, 4000);
+  }
+}
+
+function stopLiveWatch(){
+  if(unsubLiveWatch){ unsubLiveWatch(); unsubLiveWatch=null; }
+  if(liveWatchIv){ clearInterval(liveWatchIv); liveWatchIv=null; }
+}
+startLiveWatch();
+
+// ══════════════════════════════════════════════════════════
+// RESYNCHRONISATION AU RETOUR D'ARRIÈRE-PLAN (mobile) — sur mobile,
+// quand l'écran s'éteint ou que le navigateur passe en arrière-plan, la
+// connexion réseau du listener temps réel Firestore est souvent coupée par
+// l'OS pour économiser la batterie. Le SDK est censé se reconnecter seul,
+// mais ça reste peu fiable en pratique : on force donc une lecture fraîche
+// de liveOpen dès que l'onglet redevient visible, sans attendre le listener.
+// ══════════════════════════════════════════════════════════
+document.addEventListener('visibilitychange', async ()=>{
+  if(document.visibilityState !== 'visible') return;
+  // On lit foottournoi/status (toujours lisible) pour détecter liveOpen,
+  // même si current est illisible pour un spectateur quand liveOpen=false.
+  try {
+    const snap = await getDoc(doc(db,'foottournoi','status'));
+    if(snap.exists()) handleLiveOpenChange(snap.data().liveOpen === true);
+  } catch(e){ console.warn('resync visibilitychange', e); }
+});
+
+// ══════════════════════════════════════════════════════════
 // PERSISTANCE FIRESTORE — doc unique 'foottournoi/current'
 // ══════════════════════════════════════════════════════════
 function subscribeToTournament(){
+  // startLiveWatch (listener + polling) reste actif en parallèle sur
+  // foottournoi/status pour détecter la fermeture du live même quand
+  // foottournoi/current devient illisible (liveOpen=false).
+  if(!unsubLiveWatch || !liveWatchIv) startLiveWatch();
   unsubTournament = onSnapshot(doc(db,'foottournoi','current'), (snap)=>{
     if(!snap.exists()) return;
     const data=snap.data();
@@ -384,22 +538,32 @@ function subscribeToTournament(){
     ST.bracketBreaks    = data.bracketBreaks || [];
     if(data.results)         ST.results         = data.results;
     if(data.phase)           ST.phase           = data.phase;
-    ST.liveOpen = data.liveOpen === true;
+    handleLiveOpenChange(data.liveOpen === true);
     refreshCurrentPage();
-  });
+  }, (e)=>{ console.warn('subscribeToTournament', e); });
 }
 async function saveTournament(partial){
   if(!isAdmin() && !isScorer()) return;
-  try { await setDoc(doc(db,'foottournoi','current'), { ...partial, updatedAt: serverTimestamp() }, { merge:true }); }
+  try {
+    await setDoc(doc(db,'foottournoi','current'), { ...partial, updatedAt: serverTimestamp() }, { merge:true });
+    // Si liveOpen est dans la mise à jour, on le duplique dans foottournoi/status
+    // (document toujours lisible publiquement) pour que les spectateurs reçoivent
+    // la fermeture du live même quand current devient illisible pour eux.
+    if('liveOpen' in partial){
+      await setDoc(doc(db,'foottournoi','status'), { liveOpen: partial.liveOpen }, { merge:true });
+    }
+  }
   catch(e){ console.error('saveTournament', e); alert('Erreur de sauvegarde : '+e.message); }
 }
 function refreshCurrentPage(){
+  if(ST.page===1) renderCfgForm();
   if(ST.page===2) renderTeamsPage();
   if(ST.page===3) renderPlanningPreview();
   if(ST.page===4) renderTournamentPage();
   if(ST.page===5) renderFinalPage();
   if(ST.page==='T') renderTeamsSpecPage();
   if(ST.page==='M') renderManagerPage();
+  updateLiveToggleBtn(); // le panneau admin (bouton live) est visible en permanence, pas lié à ST.page
 }
 
 // ══════════════════════════════════════════════════════════
@@ -454,9 +618,9 @@ async function saveRoster(teamId, players){
 // ══════════════════════════════════════════════════════════
 window.drawPools = function(){
   if(!isAdmin()) return;
-  const n = ST.cfg.n||24;
+  const n = ST.cfg.n||16;
   const teams = ST.teams.slice(0,n);
-  if(teams.length < 8){ alert('Il faut au moins 8 équipes pour former 4 poules.'); return; }
+  if(teams.length < 12){ alert('Il faut au moins 12 équipes pour former 4 poules de 3 minimum (idéalement 24 pour 4 poules de 6).'); return; }
   const numPools = 4;
   const poolNames = ['A','B','C','D'];
   let ordered;
@@ -508,10 +672,10 @@ function tClub(id){ const t=tObj(id); return t?(t.club||'—'):'—'; }
 
 // ══════════════════════════════════════════════════════════
 // GÉNÉRATION DU CALENDRIER DE POULES (round-robin, chaque équipe
-// affronte une fois les 5 autres de sa poule = 5 journées x 3 matchs/poule)
+// affronte une fois les 3 autres de sa poule = 3 journées x 2 matchs/poule)
 // ══════════════════════════════════════════════════════════
 function roundRobinPairs(ids){
-  // Algorithme du "cercle" pour round-robin à 6 équipes (5 journées, 3 matchs/journée)
+  // Algorithme du "cercle" pour round-robin à 4 équipes (3 journées, 2 matchs/journée)
   const n = ids.length;
   const list = [...ids];
   if(n%2===1) list.push(null); // bye si impair
@@ -527,7 +691,7 @@ function roundRobinPairs(ids){
     // rotation (garde le premier élément fixe)
     list.splice(1,0,list.pop());
   }
-  return rounds; // [ [[a,b],[c,d],[e,f]], ... ] 5 journées
+  return rounds; // [ [[a,b],[c,d]], ... ] 3 journées
 }
 
 window.buildPoolSchedule = function(){
@@ -537,7 +701,7 @@ window.buildPoolSchedule = function(){
   const cfg = ST.cfg;
   const courts = cfg.courts||4;
 
-  // Pour chaque poule, calendrier round-robin (5 journées de 3 matchs)
+  // Pour chaque poule, calendrier round-robin (3 journées de 2 matchs)
   const poolRounds = {}; // {A:[[...pairs...] x5], B:..., C:..., D:...}
   ['A','B','C','D'].forEach(p=>{ poolRounds[p] = roundRobinPairs(pools[p]); });
 
@@ -817,33 +981,95 @@ window.generateBracket = function(){
   const cfg = ST.cfg;
   const courts = cfg.courts||4;
   if(courts<4){
-    alert('La répartition spéciale de la finale (3e-8e place sur les terrains B/C/D puis finale seule sur le terrain A) nécessite au moins 4 terrains. Configurez au moins 4 terrains (page Config) avant de générer la phase finale.');
+    alert('La phase finale nécessite au moins 4 terrains. Configurez au moins 4 terrains (page Config) avant de générer la phase finale.');
     return;
   }
   const matchSlotDur = cfg.matchDurBracket+cfg.tt;
   const tabDur = cfg.tabDuration||10;
 
-  // Départ de la phase finale = juste après le dernier créneau de poules
-  // (TAB de poule inclus), en continuité de la même timeline — la phase finale
-  // ne redémarre plus après une pause fixe : les coupures peuvent désormais
-  // tomber n'importe où, y compris pendant les poules.
+  const tabDurMin = cfg.tabDuration||10;
+  const fmt = mins => { const hh=Math.floor(mins/60)%24, mm=mins%60; return String(hh).padStart(2,'0')+':'+String(mm).padStart(2,'0'); };
+
+  // heure de début du TAB de poule (dernier créneau des poules)
   const lastPoolTime = ST.poolTabSlot ? ST.poolTabSlot.time
     : (ST.poolSchedule.length ? ST.poolSchedule[ST.poolSchedule.length-1].time : cfg.start);
-  const start = addMinutes(lastPoolTime, cfg.matchDur+cfg.tt);
+  // fin réelle du TAB de poule
+  const lastPoolEndMin = timeToMinutes(lastPoolTime) + tabDurMin;
+  // début "naturel" de la finale = fin TAB + transition
+  const naturalStartMin = lastPoolEndMin + cfg.tt;
 
-  // Matchs du tour 3 traités à part : 3e-4e (m35), 5e-6e (m34), 7e-8e (m33)
-  // joués en même temps sur les terrains B, C, D ; la finale 1ère-2e (m36)
-  // se joue ENSUITE, seule, sur le terrain A.
-  const ROUND3_PODIUM_NUMS = [33,34,35]; // 7-8e, 5-6e, 3-4e
-  const ROUND3_FINAL_NUM   = 36;          // finale 1-2e
-  const round3Rest = BRACKET_ROUND3.filter(b=>!ROUND3_PODIUM_NUMS.includes(b.m) && b.m!==ROUND3_FINAL_NUM); // places 9e à 24e
+
+
+  // Coupures réellement insérées pendant les poules = source de vérité.
+  // On compare par durée + label (les seuls champs fiables dans poolBreaks).
+  const appliedBreaksReliable = new Set();
+  (ST.poolBreaks||[]).forEach(pb=>{
+    const matched = (cfg.breaks||[]).find(c=>
+      c.duration===pb.duration && (c.label||'Coupure')===(pb.label||'Coupure'));
+    if(matched) appliedBreaksReliable.add(matched.time+'_'+matched.duration);
+  });
+
+  // Insertion des pauses de transition : toute pause NON encore appliquée
+  // dont l'heure configurée est AVANT le début naturel de la finale.
+  // On part de naturalStartMin et on insère chaque pause chronologiquement,
+  // en décalant le curseur. Peu importe que brkMin soit avant ou après
+  // lastPoolEndMin : si elle n'est pas dans poolBreaks, elle n'a pas été
+  // insérée, et doit donc l'être ici.
+  let startMin = naturalStartMin;
+  const transitionBreaks = [];
+  const pending = (cfg.breaks||[]).slice().sort((a,b)=>timeToMinutes(a.time)-timeToMinutes(b.time));
+  for(const brk of pending){
+    const key = brk.time+'_'+brk.duration;
+    if(appliedBreaksReliable.has(key)) continue;
+    const brkMin = timeToMinutes(brk.time);
+    // La pause est éligible si elle était censée tomber avant (ou au moment de)
+    // la fin du TAB + transition — c'est-à-dire avant le début de la finale.
+    if(brkMin <= naturalStartMin){
+      appliedBreaksReliable.add(key);
+      const pauseEnd = startMin + brk.duration;
+      transitionBreaks.push({
+        afterSlot: ST.poolTabSlot ? ST.poolTabSlot.slot : -1,
+        startTime: fmt(startMin), endTime: fmt(pauseEnd),
+        label: brk.label||'Coupure', duration: brk.duration
+      });
+      startMin = pauseEnd;
+    }
+  }
+  // start = fin de la dernière pause qui couvre la fenêtre de transition,
+  // qu'elle soit dans poolBreaks (insérée pendant les poules) ou dans
+  // transitionBreaks (insérée ci-dessus). On prend le max entre naturalStartMin
+  // et la fin de toutes les pauses déjà connues qui tombent après lastPoolEndMin.
+  const allKnownBreaks = [...(ST.poolBreaks||[]), ...transitionBreaks];
+  const latestBreakEnd = allKnownBreaks
+    .filter(b => timeToMinutes(b.startTime) >= lastPoolEndMin - tabDurMin)
+    .reduce((max, b) => Math.max(max, timeToMinutes(b.endTime)), naturalStartMin);
+  let start = fmt(latestBreakEnd + cfg.tt);
+
+  // Ces coupures de transition se rattachent visuellement à la fin des
+  // poules (juste après le créneau T.A.B.) : on les ajoute à ST.poolBreaks
+  // pour qu'elles s'affichent au même endroit que les autres coupures de
+  // poule, dans le planning (preview ET vue en direct).
+  if(transitionBreaks.length){
+    ST.poolBreaks = [...(ST.poolBreaks||[]), ...transitionBreaks];
+  }
+
+  // Tour 3 : 12 matchs, en 3 blocs
+  // Bloc A (places 17-24) : M25-M28 — 4 matchs répartis sur courts terrains
+  // Bloc B (places 9-16)  : M29-M32 — 4 matchs répartis sur courts terrains
+  // Bloc C (places 1-8)   : M33-M34 en parallèle, puis M35 et M36 (finale) seuls
+  const ROUND3_FINAL_NUM = 36; // finale 1-2e
+  const round3BlockA = BRACKET_ROUND3.filter(b=>b.m>=25&&b.m<=28); // 17-24e
+  const round3BlockB = BRACKET_ROUND3.filter(b=>b.m>=29&&b.m<=32); // 9-16e
+  const round3BlockC = BRACKET_ROUND3.filter(b=>b.m>=33&&b.m<=34); // 7-8e + 5-6e
+  const round3M35 = BRACKET_BY_NUM[35]; // 3-4e place
+  const round3M36 = BRACKET_BY_NUM[36]; // finale
 
   const rawSchedule=[];
   const tabSlots=[]; // { round, slot }
   const slotDurations=[];
   let slotIdx=0;
 
-  // ── Tours 1 et 2 : inchangés (créneaux de `courts` matchs + TAB après) ──
+  // ── Tours 1 et 2 : créneaux de `courts` matchs + TAB après chaque tour ──
   [BRACKET_ROUND1, BRACKET_ROUND2].forEach((round,ri)=>{
     for(let i=0;i<round.length;i+=courts){
       const slot = round.slice(i,i+courts);
@@ -858,49 +1084,42 @@ window.generateBracket = function(){
     slotIdx++;
   });
 
-  // ── Tour 3, partie 1 : places 9e à 24e (6 matchs, créneaux normaux) ──
-  for(let i=0;i<round3Rest.length;i+=courts){
-    const slot = round3Rest.slice(i,i+courts);
-    slot.forEach((b,ci)=>{
-      rawSchedule.push({ m:b.m, round:3, court:ci+1, slot:slotIdx, label: b.label||null });
-    });
-    slotDurations.push(matchSlotDur);
-    slotIdx++;
+  // ── Tour 3, Bloc A : places 17-24 (M25-M28) ──
+  for(let i=0;i<round3BlockA.length;i+=courts){
+    const slot = round3BlockA.slice(i,i+courts);
+    slot.forEach((b,ci)=>{ rawSchedule.push({ m:b.m, round:3, court:ci+1, slot:slotIdx, label:b.label||null }); });
+    slotDurations.push(matchSlotDur); slotIdx++;
   }
 
-  // ── Tour 3, partie 2 : 7-8e / 5-6e / 3-4e en même temps sur B, C, D (terrains 2,3,4) ──
-  const podiumSlotIdx = slotIdx;
-  ROUND3_PODIUM_NUMS.forEach((mNum,ci)=>{
-    const b = BRACKET_BY_NUM[mNum];
-    rawSchedule.push({ m:mNum, round:3, court:ci+2, slot:podiumSlotIdx, label: b.label||null }); // terrains 2(B),3(C),4(D)
-  });
-  slotDurations.push(matchSlotDur);
-  slotIdx++;
+  // ── Tour 3, Bloc B : places 9-16 (M29-M32) ──
+  for(let i=0;i<round3BlockB.length;i+=courts){
+    const slot = round3BlockB.slice(i,i+courts);
+    slot.forEach((b,ci)=>{ rawSchedule.push({ m:b.m, round:3, court:ci+1, slot:slotIdx, label:b.label||null }); });
+    slotDurations.push(matchSlotDur); slotIdx++;
+  }
 
-  // créneau TAB dédié pour ce bloc 3e-8e (avant la finale, au cas où l'un de
-  // ces 3 matchs se termine à égalité).
-  tabSlots.push({ round: 3, slot: slotIdx, label:'T.A.B. — places 3e à 8e' });
-  slotDurations.push(tabDur);
-  slotIdx++;
+  // ── Tour 3, Bloc C : 7-8e + 5-6e en même temps (M33, M34) ──
+  for(let i=0;i<round3BlockC.length;i+=courts){
+    const slot = round3BlockC.slice(i,i+courts);
+    slot.forEach((b,ci)=>{ rawSchedule.push({ m:b.m, round:3, court:ci+1, slot:slotIdx, label:b.label||null }); });
+    slotDurations.push(matchSlotDur); slotIdx++;
+  }
 
-  // ── Tour 3, partie 3 : finale 1ère-2e place, SEULE sur le terrain A (terrain 1) ──
-  const finalSlotIdx = slotIdx;
-  const finalB = BRACKET_BY_NUM[ROUND3_FINAL_NUM];
-  rawSchedule.push({ m:ROUND3_FINAL_NUM, round:3, court:1, slot:finalSlotIdx, label: finalB.label||null });
-  slotDurations.push(matchSlotDur);
-  slotIdx++;
+  // ── Tour 3, M35 : 3e-4e place ──
+  rawSchedule.push({ m:35, round:3, court:1, slot:slotIdx, label:round3M35.label||null });
+  slotDurations.push(matchSlotDur); slotIdx++;
 
-  // créneau TAB final (pour la finale elle-même, en cas d'égalité).
-  tabSlots.push({ round: 3, slot: slotIdx, label:'T.A.B. — Finale' });
-  slotDurations.push(tabDur);
-  slotIdx++;
+  // ── Tour 3, M36 : Finale 1-2e place (seule) ──
+  rawSchedule.push({ m:36, round:3, court:1, slot:slotIdx, label:round3M36.label||null });
+  slotDurations.push(matchSlotDur); slotIdx++;
+
+  // Pas de créneau TAB après la finale : bouton "Classement final" en bas du tour 3.
 
   const totalSlots = slotIdx;
-  // Reprend les coupures déjà consommées pendant les poules (pour ne pas les
-  // réappliquer), puis poursuit la timeline sur la phase finale.
-  const poolTimes = ST.poolSchedule.map(m=>m.time).concat(ST.poolTabSlot?[ST.poolTabSlot.time]:[]);
-  const appliedBreaks = appliedBreaksFromSchedule(poolTimes, cfg.breaks);
-  const { times: slotTimes, insertedBreaks } = computeSlotTimes(start, slotDurations, totalSlots, cfg.breaks, appliedBreaks);
+  // (Les coupures déjà consommées pendant les poules, et celle éventuelle de
+  // la fenêtre de transition, ont déjà été retirées de `appliedBreaks`
+  // ci-dessus — on poursuit simplement la timeline sur la phase finale.)
+  const { times: slotTimes, insertedBreaks } = computeSlotTimes(start, slotDurations, totalSlots, cfg.breaks, appliedBreaksReliable);
 
   const schedule = rawSchedule.map(m=>({ ...m, time: slotTimes[m.slot] }));
   const tabSlotsWithTime = tabSlots.map(t=>({ ...t, time: slotTimes[t.slot] }));
@@ -909,7 +1128,7 @@ window.generateBracket = function(){
   ST.bracketTabSlots = tabSlotsWithTime; // créneaux TAB après chaque tour + bloc podium + finale (info)
   ST.bracketBreaks = insertedBreaks; // coupures réellement insérées pendant la phase finale (affichage planning)
   ST.phase = 'bracket';
-  saveTournament({ bracketSchedule: schedule, bracketTabSlots: tabSlotsWithTime, bracketBreaks: insertedBreaks, phase:'bracket' });
+  saveTournament({ bracketSchedule: schedule, bracketTabSlots: tabSlotsWithTime, bracketBreaks: insertedBreaks, poolBreaks: ST.poolBreaks, phase:'bracket' });
   renderTournamentPage();
 };
 
@@ -992,7 +1211,7 @@ function updateBackFwdLabels(){
   }
 }
 function canGoFwd(){
-  if(ST.page===1) return ST.teams.length>=8;
+  if(ST.page===1) return ST.teams.length>=12;
   if(ST.page===2) return ST.pools.A.length>0;
   if(ST.page===3) return ST.poolSchedule.length>0;
   if(ST.page===4) return ST.phase==='bracket' || ST.phase==='done';
@@ -1051,8 +1270,17 @@ window.goTo = function(n){
   if(n===4) renderTournamentPage();
   if(n===5) renderFinalPage();
 };
-window.spectatorGoLive = function(n){
+window.spectatorGoLive = async function(n){
+  // Forcer une lecture Firestore fraîche avant de vérifier liveOpen :
+  // le listener onSnapshot peut avoir du retard sur mobile (OS suspend la
+  // connexion WebSocket en veille). Ce getDoc garantit qu'on a l'état réel
+  // au moment du tap, sans attendre la prochaine notification du listener.
+  try {
+    const snap = await getDoc(doc(db,'foottournoi','current'));
+    if(snap.exists()) handleLiveOpenChange(snap.data().liveOpen === true);
+  } catch(e){ console.warn('spectatorGoLive: relecture liveOpen échouée', e); }
   if(n!=='R' && isLiveBlocked()){
+    pendingSpecTarget = n;
     const overlay = document.getElementById('liveClosedOverlay');
     if(overlay) overlay.style.display='flex';
     return;
@@ -1090,9 +1318,14 @@ window.toggleAdminPanel = function(){
 };
 window.toggleLiveOpen = async function(){
   if(!isAdmin()) return;
-  ST.liveOpen = !ST.liveOpen;
-  await saveTournament({ liveOpen: ST.liveOpen });
-  updateLiveToggleBtn();
+  const newVal = !ST.liveOpen;
+  // Mise à jour optimiste locale : handleLiveOpenChange() sera aussi appelé
+  // par le onSnapshot Firestore en retour (sur tous les autres appareils),
+  // mais on l'appelle ici immédiatement pour que l'admin voie le changement
+  // sans délai. Le getDoc post-save était peu fiable : Firestore peut renvoyer
+  // l'ancienne valeur si la propagation n'est pas encore faite.
+  handleLiveOpenChange(newVal);
+  await saveTournament({ liveOpen: newVal });
 };
 function updateLiveToggleBtn(){
   const btn=document.getElementById('liveToggleBtn');
@@ -1173,7 +1406,8 @@ window.changeUserRole = async function(userId, newRole){
   if(!isAdmin()) return;
   try {
     const patch = { role: newRole };
-    if(newRole!=='manager') patch.teamId = null;
+    if(newRole!=='manager'){ patch.teamId = null; patch.tournament = null; }
+    else { patch.tournament = 'foot24'; }
     await updateDoc(doc(db,'users',userId), patch);
     loadUsersList();
   } catch(e){
@@ -1245,13 +1479,24 @@ window.createStaffAccount = async function(){
     const newUid = cred.user.uid;
     await updateProfile(cred.user, { displayName: name });
 
-    // 2. Crée la fiche Firestore avec le rôle choisi (+ teamId si manager)
-    const userDoc = { email, name, role, createdAt: serverTimestamp(), createdBy: adminEmail };
-    if(role==='manager') userDoc.teamId = teamId;
-    await setDoc(doc(db,'users',newUid), userDoc);
+    // 2. Crée la fiche Firestore en 'spectator' uniquement — c'est le SEUL rôle
+    // qu'un compte est autorisé à s'auto-attribuer à la création (règle Firestore).
+    // On ne peut pas écrire directement le rôle choisi ici : à ce stade, c'est le
+    // NOUVEAU compte qui est connecté (request.auth.uid == newUid), pas l'admin.
+    await setDoc(doc(db,'users',newUid), {
+      email, name, role:'spectator', createdAt: serverTimestamp(), createdBy: adminEmail
+    });
 
     // 3. Reconnecte l'admin avec son propre mot de passe
     await signInWithEmailAndPassword(auth, adminEmail, adminPwd);
+
+    // 4. Maintenant reconnecté en admin : promeut le compte au rôle choisi via
+    // update (autorisé par la règle Firestore uniquement pour un admin).
+    if(role !== 'spectator'){
+      const patch = { role };
+      if(role==='manager'){ patch.teamId = teamId; patch.tournament = 'foot24'; }
+      await updateDoc(doc(db,'users',newUid), patch);
+    }
 
     setMsg(`✓ Compte staff créé pour ${name} (${roleBadge(role)}${role==='manager'?' — '+tName(teamId):''}). Vous êtes reconnecté en admin.`,'grn');
     document.getElementById('newStaffName').value='';
@@ -1352,6 +1597,12 @@ function getCfg(){
   };
 }
 function renderCfgForm(){
+  // Si l'utilisateur est en train de taper dans un champ de cette page,
+  // on ne réécrit pas par-dessus (évite d'effacer une saisie en cours
+  // suite à une mise à jour reçue depuis l'autre appareil).
+  const cfgFormEl = document.getElementById('page1');
+  if(cfgFormEl && cfgFormEl.contains(document.activeElement) &&
+     ['INPUT','SELECT','TEXTAREA'].includes(document.activeElement.tagName)) return;
   const c = ST.cfg;
   const setV=(id,v)=>{ const el=document.getElementById(id); if(el) el.value=v; };
   setV('cfg_n', c.n);
@@ -1367,28 +1618,29 @@ function renderCfgForm(){
   onCfgChange();
 }
 window.onCfgChange = function(){
-  const n = +(document.getElementById('cfg_n')?.value||24);
+  const n = +(document.getElementById('cfg_n')?.value||16);
   const courts = +(document.getElementById('cfg_courts')?.value||4);
   const matchDur = +(document.getElementById('cfg_matchdur')?.value||12);
   const tt = +(document.getElementById('cfg_tt')?.value||4);
 
-  // Estimation poules
-  const numPools=4, teamsPerPool=Math.ceil(n/numPools);
-  const journees = teamsPerPool - (teamsPerPool%2===0?1:0) || teamsPerPool-1;
-  const matchesPerJournee = numPools * Math.floor(teamsPerPool/2);
+  // Estimation poules (24 équipes, 4 poules de 6, 5 journées round-robin)
+  const numPools=4, teamsPerPool=Math.ceil(n/numPools); // 6
+  const journees = teamsPerPool - 1; // 5 journées pour 6 équipes (round-robin)
+  const matchesPerJournee = numPools * Math.floor(teamsPerPool/2); // 4*3=12
   const slotsNeeded = Math.ceil(matchesPerJournee/courts) * Math.max(1,journees);
   const poolDuration = (slotsNeeded+1) * (matchDur+tt); // +1 = créneau TAB de poule
 
-  // Estimation phase finale : 36 matchs (12+12+12) + 3 créneaux TAB, répartis sur `courts` terrains
-  const bracketSlots = Math.ceil(12/courts)*3 + 3;
-  const bracketDuration = bracketSlots*(matchDur+tt);
+  // Estimation phase finale : 36 matchs (12+12+12) + 2 créneaux TAB, répartis sur `courts` terrains
+  const bracketSlots = Math.ceil(12/courts)*3 + 2;
+  const matchDurBracket = +(document.getElementById('cfg_matchdur_bracket')?.value||12);
+  const bracketDuration = bracketSlots*(matchDurBracket+tt);
 
   const infoEl = document.getElementById('cfg_info');
   if(infoEl){
     infoEl.className='info info-b';
     infoEl.innerHTML = `🏟️ <strong>${n} équipes</strong> réparties en <strong>4 poules</strong> de ${teamsPerPool} · <strong>${courts} terrain${courts>1?'s':''}</strong><br>
-    📅 Phase de poules : ~<strong>${journees} journées</strong> + créneau T.A.B., durée estimée <strong>${Math.round(poolDuration/60*10)/10}h</strong><br>
-    🏆 Phase finale : <strong>36 matchs</strong> (3 tours) + créneaux T.A.B., durée estimée <strong>${Math.round(bracketDuration/60*10)/10}h</strong>`;
+    📅 Phase de poules : ~<strong>${journees} journées</strong> (${matchesPerJournee} matchs/journée) + créneau T.A.B., durée estimée <strong>${Math.round(poolDuration/60*10)/10}h</strong><br>
+    🏆 Phase finale : <strong>36 matchs</strong> (3 tours × 12) + créneaux T.A.B., durée estimée <strong>${Math.round(bracketDuration/60*10)/10}h</strong>`;
   }
 
   const start=document.getElementById('cfg_start')?.value||'09:00';
@@ -1417,10 +1669,10 @@ window.saveCfgAndNext = async function(){
 // PAGE 2 — ÉQUIPES & TIRAGE DES POULES
 // ══════════════════════════════════════════════════════════
 function renderTeamsPage(){
-  const limit = ST.cfg.n||24;
+  const limit = ST.cfg.n||16;
   const list = document.getElementById('teamList');
   const info = document.getElementById('teamCountInfo');
-  if(info) info.textContent = ST.teams.length + ' équipe' + (ST.teams.length>1?'s':'') + ' / ' + limit;
+  if(info) info.textContent = ST.teams.length + ' équipe' + (ST.teams.length>1?'s':'') + ' / ' + limit + ' (4 poules de 6)';
   if(list){
     if(!ST.teams.length){
       list.innerHTML='<div class="info info-y">Aucune équipe enregistrée.</div>';
@@ -1430,7 +1682,7 @@ function renderTeamsPage(){
           <span style="font-family:'Oswald',sans-serif;font-size:15px;color:var(--dim);min-width:26px">${i+1}</span>
           <div style="flex:1;min-width:0">
             <div style="font-weight:700;color:var(--ink)">${t.name} ${t.club&&t.club!==t.name?`<span class="t-club-badge">${t.club}</span>`:''}</div>
-            <div style="font-size:11px;color:var(--muted)">${t.licence?('Licence : '+t.licence):''} ${'⭐'.repeat(t.lv||1)}</div>
+            <div style="font-size:11px;color:var(--muted)">${'⭐'.repeat(t.lv||1)}${t.respNom?` · 🛡️ ${t.respNom}`:''}${t.respTel?` · 📞 ${t.respTel}`:''}</div>
           </div>
           ${isAdmin()?`<button onclick="openEditTeam('${t.id}')" style="background:none;border:1px solid var(--blu);color:var(--blu);border-radius:5px;padding:2px 8px;cursor:pointer;font-size:11px;margin-right:4px">✏️</button><button onclick="removeTeam('${t.id}')" style="background:none;border:1px solid var(--red);color:var(--red);border-radius:5px;padding:2px 8px;cursor:pointer;font-size:11px">✕</button>`:''}
         </div>`).join('');
@@ -1445,16 +1697,18 @@ window.addTeam = async function(){
   const name = document.getElementById('t_name').value.trim();
   const club = document.getElementById('t_club').value.trim() || name;
   const lv   = +document.getElementById('t_lv').value || 3;
+  const respNom = document.getElementById('t_resp').value.trim();
+  const respTel = document.getElementById('t_tel').value.trim();
   if(!name){ alert('Le nom de l\'équipe est obligatoire.'); return; }
   const id = 't_'+Date.now()+'_'+Math.random().toString(36).slice(2,6);
-  ST.teams.push({ id, name, club, lv });
+  ST.teams.push({ id, name, club, lv, respNom, respTel });
   await saveTournament({ teams: ST.teams });
   // Crée le doc teamRosters vide associé : nécessaire pour que le futur responsable
   // d'équipe (manager) puisse ensuite faire un update (et non un create, qui lui
   // est interdit par les règles Firestore) lors de sa 1ère sauvegarde de joueurs.
   try { await setDoc(doc(db,'teamRosters',id), { players: [], updatedAt: serverTimestamp() }); }
   catch(e){ console.warn('Création teamRosters initiale échouée (non bloquant)', e); }
-  ['t_name','t_club'].forEach(fid=>{ const el=document.getElementById(fid); if(el) el.value=''; });
+  ['t_name','t_club','t_resp','t_tel'].forEach(fid=>{ const el=document.getElementById(fid); if(el) el.value=''; });
   renderTeamsPage();
 };
 window.removeTeam = async function(id){
@@ -1476,12 +1730,15 @@ window.clearTeams = async function(){
 window.autoFillTeams = async function(){
   if(!isAdmin()) return;
   const n = 24;
-  const villes = ['Nantes','Rennes','Angers','Le Mans','Laval','Cholet','La Roche','Saint-Nazaire'];
-  const entreprises = ['Atlantic SA','TechnoSoft','BTP Ouest','Logistique Plus','MécaPro','Énergie Verte','DataCorp','AgriFoods','BâtiPro','Transport Express','Numérique+','GreenBuild'];
+  const clubs = ['Nantes Atlantique FC','Rezé Entreprises','Saint-Herblain Corp.','Orvault Industries','Bouguenais United','Carquefou Business','Vertou FC Pro','Clisson Entreprises','Sautron Corporate','Couëron Industries','Basse-Goulaine FC','Le Loroux Pro','Brains Business','Saint-Sébastien Corp.','La Chapelle United','Vallet Industries','Nantes Nord FC','Sainte-Luce Ent.','La Montagne Pro','Indre Business FC','Mauves Corp.','Ancenis United','Blain Industries','Châteaubriant FC'];
+  const prenoms = ['Jean','Marc','Pierre','Alain','Didier','Bruno','Pascal','Eric','Frédéric','Olivier','Stéphane','Laurent','Philippe','Christophe','Nicolas','David','Thomas','Julien','Antoine','Romain','Maxime','Kevin','Quentin','Baptiste'];
+  const noms = ['Martin','Bernard','Dubois','Thomas','Robert','Petit','Durand','Leroy','Moreau','Simon','Laurent','Lefebvre','Michel','Garcia','Roux','Vincent','Dupont','Fontaine','Girard','Bonnet','Mercier','Boyer','Robin','Morin'];
   ST.teams=[];
   for(let i=0;i<n;i++){
-    const ent = entreprises[i%entreprises.length] + (i>=entreprises.length?' '+(Math.floor(i/entreprises.length)+1):'');
-    ST.teams.push({ id:'t_auto_'+i, name: ent, club: ent, lv: (i%5)+1 });
+    const ent = clubs[i%clubs.length];
+    const respNom = prenoms[i%prenoms.length]+' '+noms[i%noms.length];
+    const respTel = '06'+String(10000000+i*1111111).slice(0,8);
+    ST.teams.push({ id:'t_auto_'+i, name: ent, club: ent, lv: (i%5)+1, respNom, respTel });
   }
   await saveTournament({ teams: ST.teams });
   // Crée les docs teamRosters vides associés (cf. note dans addTeam()).
@@ -1497,6 +1754,8 @@ window.openEditTeam = function(id){
   document.getElementById('edit_t_name').value=t.name;
   document.getElementById('edit_t_club').value=t.club||'';
   document.getElementById('edit_t_lv').value=t.lv||3;
+  document.getElementById('edit_t_resp').value=t.respNom||'';
+  document.getElementById('edit_t_tel').value=t.respTel||'';
   document.getElementById('editTeamOverlay').style.display='flex';
 };
 window.closeEditTeam = function(){ document.getElementById('editTeamOverlay').style.display='none'; };
@@ -1507,8 +1766,10 @@ window.saveEditTeam = async function(){
   const name=document.getElementById('edit_t_name').value.trim();
   const club=document.getElementById('edit_t_club').value.trim()||name;
   const lv=+document.getElementById('edit_t_lv').value||3;
+  const respNom=document.getElementById('edit_t_resp').value.trim();
+  const respTel=document.getElementById('edit_t_tel').value.trim();
   if(!name){ alert('Le nom est obligatoire.'); return; }
-  t.name=name; t.club=club; t.lv=lv;
+  t.name=name; t.club=club; t.lv=lv; t.respNom=respNom; t.respTel=respTel;
   await saveTournament({ teams: ST.teams });
   closeEditTeam(); renderTeamsPage();
   if(ST.poolSchedule.length){ renderPlanningPreview(); }
@@ -1649,7 +1910,7 @@ window.printTeamSchedule = function(tid){
     </tr>`;
   }).join('');
   return `<div class="fiche">
-    <div class="fiche-hdr"><strong>${team.name}</strong></div>
+    <div class="fiche-hdr"><strong>${team.name}</strong>${(team.respNom||team.respTel)?`<div class="fiche-resp">${team.respNom?'🛡️ '+team.respNom:''}${team.respNom&&team.respTel?' · ':''}${team.respTel?'📞 '+team.respTel:''}</div>`:''}</div>
     <table>
       <thead><tr><th>Phase</th><th>Heure</th><th>Terrain</th><th>Adversaire</th><th>Score</th><th>Résultat</th></tr></thead>
       <tbody>${tableRows}</tbody>
@@ -1665,6 +1926,7 @@ window.printTeamScheduleSingle = function(tid){
   <style>
     *{box-sizing:border-box;margin:0;padding:0} body{font-family:Arial;font-size:12px;padding:12px}
     .fiche-hdr{font-size:15px;font-weight:700;margin-bottom:8px;padding-bottom:6px;border-bottom:2px solid #1a2540}
+    .fiche-resp{font-size:11px;font-weight:400;color:#444;margin-top:2px}
     table{width:100%;border-collapse:collapse} th{background:#1a2540;color:#fff;padding:5px 8px;text-align:left;font-size:11px}
     td{padding:5px 8px;border-bottom:1px solid #eee}
     .fiche-bilan{margin-top:8px;font-weight:700;color:#1a2540;background:#f0f4ff;padding:6px 8px;border-radius:4px}
@@ -1685,6 +1947,7 @@ window.printAllTeamSchedules = function(){
     *{box-sizing:border-box;margin:0;padding:0} body{font-family:Arial;font-size:9px}
     .fiche{border:1px solid #bbb;border-radius:2px;padding:4px 5px;break-inside:avoid}
     .fiche-hdr{font-size:10px;font-weight:700;margin-bottom:2px;padding-bottom:2px;border-bottom:1.5px solid #1a2540}
+    .fiche-resp{font-size:8px;font-weight:400;color:#444;margin-top:1px}
     table{width:100%;border-collapse:collapse;font-size:8px} th{background:#1a2540;color:#fff;padding:2px 4px}
     td{padding:1.5px 4px;border-bottom:1px solid #eee}
     .fiche-bilan{margin-top:2px;font-size:9px;font-weight:700;color:#1a2540;text-align:right}
@@ -1747,7 +2010,15 @@ function renderPoolsView(){
 
   const listEl = document.getElementById('poolMatchList');
   if(ST.activePoolRound===TAB_SLOT_KEY){
-    if(listEl) listEl.innerHTML = poolTabSummaryHTML();
+    let html = poolTabSummaryHTML();
+    const breaksAfterTab = ST.poolTabSlot ? (ST.poolBreaks||[]).filter(b=>b.afterSlot===ST.poolTabSlot.slot) : [];
+    breaksAfterTab.forEach(b=>{
+      html += `<div style="background:rgba(180,60,60,.08);border:1px dashed #b43c3c;border-radius:8px;padding:10px 14px;margin-top:4px">
+        <div style="font-family:'Oswald',sans-serif;font-size:22px;font-weight:700;color:#b43c3c;margin-bottom:2px">🕐 ${b.startTime} – ${b.endTime}</div>
+        <div style="font-size:12px">☕ <strong>${b.label}</strong> (${b.duration} min) — avant le début de la phase finale</div>
+      </div>`;
+    });
+    if(listEl) listEl.innerHTML = html;
     renderPoolStandingsPanel();
     return;
   }
@@ -1811,14 +2082,12 @@ const POOL_COLORS = {
   C: { main:'#d9822b', bg:'rgba(217,130,43,.10)' },   // orange
   D: { main:'#9b59d9', bg:'rgba(155,89,217,.10)' },   // violet
 };
-// Couleur de ligne selon le rang : 1-2 (tableau "Champions") vert,
-// 3-4 (tableau intermédiaire) jaune/neutre, 5-6 (tableau "Consolante") orange/rouge.
-// Aucun rang n'est éliminé : tous se qualifient pour la phase finale, juste sur
-// un tableau différent — la couleur indique simplement ce tableau, pas une élimination.
+// Couleur de ligne selon le rang (6 par poule) :
+// 1-2 (tableau 1-8) vert, 3-4 (tableau 9-16) jaune, 5-6 (tableau 17-24) rouge doux.
 function rankRowColor(rank){
   if(rank<=2) return 'rgba(30,166,114,.12)';
   if(rank<=4) return 'rgba(217,180,43,.10)';
-  return 'rgba(217,90,43,.10)';
+  return 'rgba(180,60,60,.08)';
 }
 function renderPoolStandingsPanel(){
   const el=document.getElementById('poolStandingsPanel'); if(!el) return;
@@ -1848,9 +2117,9 @@ function renderPoolStandingsPanel(){
       </div>`;
     }).join('') + `</div>
     <div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;font-size:10px;color:var(--muted)">
-      <span><span style="display:inline-block;width:10px;height:10px;background:rgba(30,166,114,.5);border-radius:2px;margin-right:3px"></span>Tableau 1-2 (haut de tableau)</span>
-      <span><span style="display:inline-block;width:10px;height:10px;background:rgba(217,180,43,.5);border-radius:2px;margin-right:3px"></span>Tableau 3-4</span>
-      <span><span style="display:inline-block;width:10px;height:10px;background:rgba(217,90,43,.5);border-radius:2px;margin-right:3px"></span>Tableau 5-6</span>
+      <span><span style="display:inline-block;width:10px;height:10px;background:rgba(30,166,114,.5);border-radius:2px;margin-right:3px"></span>Tableau 1-2 (places 1-8)</span>
+      <span><span style="display:inline-block;width:10px;height:10px;background:rgba(217,180,43,.5);border-radius:2px;margin-right:3px"></span>Tableau 3-4 (places 9-16)</span>
+      <span><span style="display:inline-block;width:10px;height:10px;background:rgba(180,60,60,.3);border-radius:2px;margin-right:3px"></span>Tableau 5-6 (places 17-24)</span>
     </div>`;
 }
 
@@ -1865,7 +2134,7 @@ function renderBracketView(){
     tabsEl.innerHTML = [1,2,3].map(r=>{
       const matches = ST.bracketSchedule.filter(b=>b.round===r);
       const done = matches.length && matches.every(b=>bracketMatchWinner(b.m)!=null);
-      const label = r===1?'Tour 1 (poules 3-6e)':r===2?'Tour 2':'Classement final';
+      const label = r===1?'Tour 1':r===2?'Tour 2':'Classement final';
       return `<button class="rtab ${r===ST.activeBracketRound?'active':''} ${done?'done':''}" onclick="setBracketRound(${r})">${label}${done?' ✓':''}</button>`;
     }).join('');
   }
@@ -1879,7 +2148,7 @@ function renderBracketView(){
     } else {
       // Regroupe les matchs par créneau (slot), puis interleave avec les
       // créneaux T.A.B. selon leur position chronologique (un tour peut
-      // désormais contenir plusieurs blocs : ex. places 9-24e, puis 3-8e +
+      // désormais contenir plusieurs blocs : ex. places 9-16e, puis 3-8e +
       // T.A.B., puis finale seule + T.A.B.).
       const bySlot = {};
       matches.forEach(b=>{ (bySlot[b.slot]=bySlot[b.slot]||[]).push(b); });
@@ -1914,10 +2183,27 @@ function renderBracketView(){
         return block;
       }).join('');
       listEl.innerHTML = html;
+      appendFinalRankingBtn();
     }
   }
 }
 window.setBracketRound = function(r){ ST.activeBracketRound=r; renderBracketView(); };
+
+// Bouton "Classement final" affiché en bas du tour 3 quand tous les matchs sont joués
+function appendFinalRankingBtn(){
+  if(ST.activeBracketRound!==3) return;
+  const listEl = document.getElementById('bracketMatchList'); if(!listEl) return;
+  const round3 = ST.bracketSchedule.filter(b=>b.round===3);
+  if(!round3.length) return;
+  const allDone = round3.every(b=>bracketMatchWinner(b.m)!=null);
+  // Affiche le bouton même si le tournoi n'est pas terminé (partiel), en grisé
+  const btn = document.createElement('div');
+  btn.style.cssText = 'margin-top:14px;text-align:center';
+  btn.innerHTML = `<button onclick="goTo(5)" style="padding:12px 28px;font-size:16px;font-family:'Oswald',sans-serif;font-weight:700;background:${allDone?'var(--grn)':'var(--dim)'};color:#fff;border:none;border-radius:10px;cursor:pointer;width:100%">
+    🏆 ${allDone ? 'Voir le classement final' : 'Classement final (partiel)'}
+  </button>`;
+  listEl.appendChild(btn);
+}
 
 // ── Carte de match (saisie score) ────────────────────────
 const _scoreDebounce = {}; // { 'type_matchId': timeoutId }
@@ -2048,7 +2334,7 @@ window.printFinalRanking = function(){
   win.document.write(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Classement Final</title>
   <style>*{box-sizing:border-box;margin:0;padding:0} body{font-family:Arial;padding:20px} table{width:100%;border-collapse:collapse} th{background:#0f4a1f;color:#fff;padding:8px} td{border-bottom:1px solid #ddd}
   @media print{@page{margin:10mm} .noprint{display:none!important} th{background:#0f4a1f!important;color:#fff!important} html{-webkit-print-color-adjust:exact}}</style>
-  </head><body><h2>⚽ Classement Final — Foot Entreprises Challenge</h2>
+  </head><body><h2>⚽ Classement Final — Challenge Inter-Entreprises</h2>
   <table><thead><tr><th>Place</th><th>Équipe</th></tr></thead><tbody>${rows}</tbody></table>
   <div class="noprint" style="margin-top:14px"><button onclick="window.print()">🖨 Imprimer</button></div>
   </body></html>`);
@@ -2135,10 +2421,11 @@ async function renderManagerPage(){
   for(let i=0;i<MAX_PLAYERS;i++) rows.push(players[i] || emptyPlayer());
 
   el.innerHTML = `
-    <div class="card-ttl" style="margin-bottom:10px">
+    <div class="card-ttl" style="margin-bottom:4px">
       <span>👥 Feuille d'équipe — ${team?team.name:'Équipe inconnue'}</span>
       <span style="font-size:11px;color:var(--muted)">${rows.filter(p=>p.nom||p.prenom||p.licence).length} / ${MAX_PLAYERS} joueurs renseignés</span>
     </div>
+    ${(team&&(team.respNom||team.respTel))?`<div style="font-size:12px;color:var(--muted);margin-bottom:10px">${team.respNom?'🛡️ Responsable : <strong style="color:var(--ink)">'+team.respNom+'</strong>':''}${team.respNom&&team.respTel?' · ':''}${team.respTel?'📞 <strong style="color:var(--ink)">'+team.respTel+'</strong>':''}</div>`:''}
     <div id="rosterMsg" style="font-size:12px;min-height:16px;margin-bottom:6px"></div>
     <div style="overflow-x:auto">
     <table class="stbl" style="width:100%;min-width:480px">
@@ -2405,8 +2692,8 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
      ══════════════════════════════════════════════════════ -->
 <div id="loginScreen">
   <div class="login-box">
-    <div class="login-brand">⚽ Foot Entreprises</div>
-    <div class="login-sub">Challenge Inter-Entreprises · 24 équipes</div>
+    <div class="login-brand">⚽ Challenge Inter-Entreprises</div>
+    <div class="login-sub">Challenge Inter-Entreprises · 24 équipes · 4 poules de 6</div>
     <div id="authMsg" style="text-align:center;font-size:13px;min-height:18px;margin-bottom:16px;color:var(--red)"></div>
 
     <!-- ══ ZONE SPECTATEURS ══ -->
@@ -2472,7 +2759,7 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
 
 <!-- HEADER -->
 <header class="hdr">
-  <div class="hdr-brand">⚽ Foot Entreprises</div>
+  <div class="hdr-brand">⚽ Challenge Inter-Entreprises</div>
   <div class="hdr-user" id="hdrUserName"></div>
   <div class="hdr-r" id="hdrDesktopBtns">
     <button class="hdr-btn" id="ruleBtn" onclick="toggleRules()">📋 Règlement</button>
@@ -2585,7 +2872,7 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
         </div>
         <div>
           <label>Nombre de terrains</label>
-          <input type="number" id="cfg_courts" value="4" min="1" max="12" title="Nombre de terrains" aria-label="Nombre de terrains" oninput="onCfgChange()">
+          <input type="number" id="cfg_courts" value="6" min="1" max="12" title="Nombre de terrains" aria-label="Nombre de terrains" oninput="onCfgChange()">
         </div>
         <div>
           <label>Heure de début</label>
@@ -2595,7 +2882,7 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
       <div class="fr">
         <div>
           <label>Durée match phase de poules (min)</label>
-          <input type="number" id="cfg_matchdur" value="12" min="5" max="30" title="Durée match phase de poules en minutes" aria-label="Durée match phase de poules" oninput="onCfgChange()">
+          <input type="number" id="cfg_matchdur" value="10" min="5" max="30" title="Durée match phase de poules en minutes" aria-label="Durée match phase de poules" oninput="onCfgChange()">
         </div>
         <div>
           <label>Durée match phase finale (min)</label>
@@ -2603,7 +2890,7 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
         </div>
         <div>
           <label>Transition entre matchs (min)</label>
-          <input type="number" id="cfg_tt" value="4" min="0" max="20" title="Transition entre matchs en minutes" aria-label="Transition entre matchs" oninput="onCfgChange()">
+          <input type="number" id="cfg_tt" value="3" min="0" max="20" title="Transition entre matchs en minutes" aria-label="Transition entre matchs" oninput="onCfgChange()">
         </div>
       </div>
       <div id="cfg_info" class="info info-b" style="font-size:12px"></div>
@@ -2669,8 +2956,8 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
     <div class="fg">
       <div class="fr">
         <div>
-          <label>Nom de l'équipe / Entreprise</label>
-          <input type="text" id="t_name" placeholder="Atlantic SA" onkeydown="if(event.key==='Enter')addTeam()">
+          <label>Nom de l'équipe / Club</label>
+          <input type="text" id="t_name" placeholder="FC Vétérans Nantes" onkeydown="if(event.key==='Enter')addTeam()">
         </div>
         <div>
           <label>Club / Référence (optionnel)</label>
@@ -2682,6 +2969,16 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
             <option value="1">⭐</option><option value="2">⭐⭐</option>
             <option value="3" selected>⭐⭐⭐</option><option value="4">⭐⭐⭐⭐</option><option value="5">⭐⭐⭐⭐⭐</option>
           </select>
+        </div>
+      </div>
+      <div class="fr">
+        <div>
+          <label>Responsable d'équipe</label>
+          <input type="text" id="t_resp" placeholder="Nom du responsable" onkeydown="if(event.key==='Enter')addTeam()">
+        </div>
+        <div>
+          <label>N° de téléphone du responsable</label>
+          <input type="tel" id="t_tel" placeholder="06 12 34 56 78" onkeydown="if(event.key==='Enter')addTeam()">
         </div>
       </div>
       <button class="btn btn-g" onclick="addTeam()">➕ Ajouter l'équipe</button>
@@ -2721,6 +3018,8 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
       <div><label>Niveau</label>
         <select id="edit_t_lv" title="Niveau de l'équipe" aria-label="Niveau de l'équipe"><option value="1">⭐</option><option value="2">⭐⭐</option><option value="3">⭐⭐⭐</option><option value="4">⭐⭐⭐⭐</option><option value="5">⭐⭐⭐⭐⭐</option></select>
       </div>
+      <div><label>Responsable d'équipe</label><input type="text" id="edit_t_resp" title="Responsable d'équipe" aria-label="Responsable d'équipe"></div>
+      <div><label>N° de téléphone du responsable</label><input type="tel" id="edit_t_tel" title="Téléphone du responsable" aria-label="Téléphone du responsable"></div>
     </div>
     <div class="flex g8 fw" style="margin-top:14px">
       <button class="btn btn-g" style="flex:1;justify-content:center" onclick="saveEditTeam()">✓ Enregistrer</button>
@@ -2890,8 +3189,8 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
 
   <div class="rules-section">
     <h4>Article 6 : Phase 1 — Format des Poules</h4>
-    <p>Les 24 équipes sont réparties en 4 poules (A, B, C, D) de 6 équipes. Chaque équipe affronte une fois les autres équipes de sa poule.</p>
-    <p>Durée des matches : 1 période unique de 12 minutes.</p>
+    <p>Les 24 équipes sont réparties en 4 poules (A, B, C, D) de 6 équipes. Chaque équipe affronte une fois les autres équipes de sa poule (5 matchs).</p>
+    <p>Durée des matches : 1 période unique de 10 minutes.</p>
     <p>Départage en cas d'égalité de points, dans l'ordre :</p>
     <ul>
       <li>Goal-average particulier (résultat lors de la rencontre directe entre les deux équipes).</li>
@@ -2914,7 +3213,7 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
 
   <div class="rules-section">
     <h4>Article 8 : Déroulement des Matches et Tirs au but</h4>
-    <p>Durée des matches : 1 période unique de 12 minutes.</p>
+    <p>Durée des matches : 1 seule période unique.</p>
     <p>En cas d'égalité à l'issue du temps réglementaire : la victoire est déterminée directement par une séance de tirs au but.</p>
     <p>Procédure des tirs au but : tous les joueurs présents et inscrits sur la feuille de match peuvent tirer un penalty. Chaque équipe exécute alternativement un tir au but jusqu'à ce qu'une équipe marque un but de plus que l'autre équipe, à égalité de tirs.</p>
   </div>
