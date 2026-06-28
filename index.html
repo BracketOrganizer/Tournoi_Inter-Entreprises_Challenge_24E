@@ -886,7 +886,24 @@ function findTiedGroups(pool){
     const key = s.pts+'_'+s.diff+'_'+s.bp;
     (groups[key]=groups[key]||[]).push(s.id);
   });
-  return Object.values(groups).filter(g=>g.length>=2);
+  // Article 6 : le goal-average PARTICULIER (confrontation directe) se
+  // vérifie AVANT de conclure à une égalité parfaite nécessitant un T.A.B.
+  // Pour un groupe de 2 équipes : si leur match direct n'était pas un nul,
+  // le classement entre elles est déjà tranché par cette confrontation —
+  // il ne peut PAS y avoir de T.A.B. dans ce cas, même si elles affichent
+  // par ailleurs les mêmes points/diff/buts marqués au global de la poule.
+  return Object.values(groups).filter(g=>{
+    if(g.length<2) return false;
+    if(g.length===2){
+      const [idA,idB]=g;
+      const direct = matches.find(m=>(m.a===idA&&m.b===idB)||(m.a===idB&&m.b===idA));
+      if(direct){
+        const r=getPoolResult(direct.matchId);
+        if(r.ga!==''&&r.gb!==''&&(+r.ga!==+r.gb)) return false; // confrontation directe décisive : pas de T.A.B.
+      }
+    }
+    return true;
+  });
 }
 
 // Pour un groupe d'équipes à égalité, retrouve les paires consécutives à
@@ -2166,6 +2183,32 @@ function renderPoolStandingsPanel(){
 }
 
 // ── Vue Phase finale (bracket) ───────────────────────────
+// Récapitulatif des matchs de phase finale terminés à égalité pour le tour
+// donné — affiché dans le créneau T.A.B. réservé après ce tour, sur le même
+// principe que le récapitulatif des poules (poolTabSummaryHTML). Contrairement
+// aux poules, il n'y a pas de "groupe d'équipes" ici : chaque match nul de la
+// phase finale doit individuellement être départagé par T.A.B. (sinon
+// personne ne peut être désigné vainqueur du match).
+function bracketTabSummaryHTML(round){
+  const matches = ST.bracketSchedule.filter(b=>b.round===round);
+  const tied = matches.filter(b=>{
+    const r=getBracketResult(b.m);
+    return r.ga!==''&&r.gb!==''&&(+r.ga===+r.gb);
+  });
+  if(!tied.length) return '<div class="info info-b" style="margin-top:8px">Aucun match à égalité pour ce tour pour le moment.</div>';
+  return `<div style="background:var(--s1);border:1px solid var(--ylw);border-radius:10px;padding:12px 14px;margin-top:8px">
+    <div style="font-size:11px;color:var(--dim);margin-bottom:8px">⚖️ Matchs à égalité — T.A.B. à départager</div>
+    ${tied.map(b=>{
+      const a=bracketTeam(b.m,'a'), bb=bracketTeam(b.m,'b');
+      const r=getBracketResult(b.m);
+      const label = b.label || bracketLabel(b.m);
+      const done = r.shootout && r.shootout.ga!=null;
+      return `<div style="font-size:13px;display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--bdr)">
+        <span><strong style="color:var(--dim);font-size:11px">${label}</strong><br>${tName(a)} – ${tName(bb)} (${r.ga}-${r.gb}) ${done?`<strong style="color:var(--grn)">T.A.B. ${r.shootout.ga}-${r.shootout.gb}</strong>`:'<span style="color:var(--ylw)">⚽ T.A.B. à saisir</span>'}</span>
+      </div>`;
+    }).join('')}
+  </div>`;
+}
 function renderBracketView(){
   const poolsEl=document.getElementById('poolsView'); if(poolsEl) poolsEl.style.display='none';
   const el=document.getElementById('bracketView'); if(!el) return;
@@ -2213,6 +2256,7 @@ function renderBracketView(){
             block = `<div style="background:var(--ylw-bg);border:1px dashed var(--ylw);border-radius:8px;padding:10px 14px;margin:4px 0">
               <div style="font-family:'Oswald',sans-serif;font-size:22px;font-weight:700;color:var(--ylw);margin-bottom:2px">🕐 ${tabSlot.time}</div>
               <div style="font-size:12px">⚽ Créneau réservé — <strong>${tabSlot.label||'T.A.B.'}</strong> pour les matchs terminés à égalité (désigne le vainqueur uniquement, ne compte pas au classement)</div>
+              ${bracketTabSummaryHTML(ST.activeBracketRound)}
             </div>`;
           }
         }
@@ -2277,6 +2321,7 @@ function saveTVSettings(patch){
 function startTVCycle(){
   stopTVCycle();
   tvScreenIndex = 0;
+  tvLastRenderedKey = null; // on force un "vrai changement d'écran" au tout premier rendu de cette session
   tvClockIv = setInterval(updateTVClock, 1000);
   updateTVClock();
   // L'avancement lui-même est (re)planifié par scheduleTVAdvance(), appelée
@@ -2559,6 +2604,7 @@ function tvFinalRankingHTML(){
   </table>`;
 }
 let tvLastScreensSig = null; // signature de la dernière liste d'écrans actifs, pour détecter un changement de groupe (ex: Tour 1 → Tour 2) et repartir au début
+let tvLastRenderedKey = null; // clé du dernier écran réellement affiché, pour distinguer un changement d'écran d'une simple actualisation de données
 function renderTVContent(){
   const el=document.getElementById('tvContent'); if(!el) return;
   const phaseEl=document.getElementById('tvPhaseBadge');
@@ -2575,6 +2621,16 @@ function renderTVContent(){
   const screen = screens[tvScreenIndex];
   const subEl=document.getElementById('tvSubTitle');
 
+  // Un vrai changement d'écran (Résultats → Classement, Tour 1 → Tour 2…)
+  // justifie de repartir du début (position de défilement + minuteur de
+  // bascule). Une simple actualisation de données en direct sur LE MÊME
+  // écran (ex : un score rentre ailleurs pendant qu'on regarde le
+  // classement) ne doit PAS tout réinitialiser — sinon l'écran Classement,
+  // plus long à lire, ne finit jamais de défiler si des scores rentrent
+  // régulièrement pendant ce temps-là.
+  const isScreenChange = !screen || screen.key !== tvLastRenderedKey;
+  tvLastRenderedKey = screen ? screen.key : null;
+
   if(!screen){
     if(subEl) subEl.textContent = '';
     el.innerHTML = `<div class="tv-empty">Rien à afficher pour le moment.</div>`;
@@ -2582,6 +2638,7 @@ function renderTVContent(){
     if(subEl) subEl.textContent = screen.title;
     el.innerHTML = screen.render();
   }
+  if(!isScreenChange) return; // données actualisées en place, on laisse le défilement/minuteur en cours suivre leur cours
   // requestAnimationFrame : on attend que la mise en page du nouveau contenu
   // soit posée avant de calculer la position de la ligne "en cours" (sinon,
   // sur un changement d'écran, la mesure peut être prise un cran trop tôt).
