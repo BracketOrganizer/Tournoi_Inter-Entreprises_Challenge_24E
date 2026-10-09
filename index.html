@@ -66,6 +66,7 @@ let MANAGER_EXTRA_TEAM_IDS = []; // autres équipes du même club confiées au m
 let MANAGER_VIEW_TEAM_ID = null; // équipe actuellement affichée dans "Mon équipe" (parmi MANAGER_TEAM_ID + MANAGER_EXTRA_TEAM_IDS)
 let MANAGER_PENDING_REQUEST = null; // demande de 2e équipe en attente de validation admin, si déposée
 let unsubTournament = null;
+let _lastTournamentSig = null; // signature du doc 'current' hors chronos
 let unsubRoster = null;
 let tvCycleIv = null;   // intervalle d'alternance Résultats/Classement en mode Écran
 let tvClockIv = null;   // intervalle de mise à jour de l'horloge en mode Écran
@@ -91,7 +92,7 @@ const ST = {
   liveOpen:false,
   registrationsOpen:false, // ouverture/fermeture de l'inscription en ligne des équipes
   phase:'pools',   // 'pools' | 'bracket' | 'done'
-  timerSec:0, timerRun:false, timerMode:'match', timerIv:null,
+  timers:{ split:false, items:{} }, // chronos synchronisés (Firestore) : split=false → 1 chrono 'all' ; split=true → 1 chrono par terrain ('1'..'N')
   referees:[],     // liste des noms d'arbitres disponibles ["Jean D.", ...]
   // Programmation des arbitres par phase et par terrain : chaque arbitre
   // affecté à un terrain fait TOUS les matchs de ce terrain sur la phase
@@ -580,9 +581,18 @@ function subscribeToTournament(){
   // foottournoi/status pour détecter la fermeture du live même quand
   // foottournoi/current devient illisible (liveOpen=false).
   if(!unsubLiveWatch || !liveWatchIv) startLiveWatch();
+  _lastTournamentSig = null;
+  syncClock();
   unsubTournament = onSnapshot(doc(db,'foottournoi','current'), (snap)=>{
     if(!snap.exists()) return;
     const data=snap.data();
+    // Chronos : mis à jour à chaque snapshot. Si SEUL le chrono a changé
+    // (start/pause/reset), on ne redessine pas le reste de l'appli.
+    ST.timers = sanitizeTimers(data.timers);
+    const _docSig = JSON.stringify({ ...data, timers:undefined, updatedAt:undefined });
+    renderTimersUI();
+    if(_docSig === _lastTournamentSig) return;
+    _lastTournamentSig = _docSig;
     if(data.cfg)             ST.cfg             = data.cfg;
     if(data.teams)           ST.teams           = data.teams;
     if(data.pools)           ST.pools           = data.pools;
@@ -648,6 +658,7 @@ function refreshCurrentPage(){
   if(regPanel && regPanel.style.display!=='none'){
     try { loadRegistrations(); } catch(e){ console.error('loadRegistrations (refresh)', e); }
   }
+  renderTimersUI();
   updateRefereesBtnVisibility();
   const refPanel = document.getElementById('refereesPanel');
   if(refPanel && refPanel.style.display!=='none'){
@@ -1285,6 +1296,7 @@ window.resetAllResults = async function(){
 window.newTournament = async function(){
   if(!isAdmin()){ alert('Admin uniquement.'); return; }
   if(!confirm('Nouveau tournoi ? Toutes les données (équipes, poules, scores) seront définitivement supprimées.')) return;
+  await tmrResetAll();
   ST.teams=[]; ST.pools={A:[],B:[],C:[],D:[]}; ST.poolSchedule=[]; ST.bracketSchedule=[];
   ST.results={}; ST.phase='pools'; ST.activeView='pools'; ST.activePoolRound=0; ST.activeBracketRound=1;
   ST.registrationsOpen = false;
@@ -2997,6 +3009,7 @@ window.printAllTeamSchedules = function(){
 // PAGE 4 — TOURNOI (live)
 // ══════════════════════════════════════════════════════════
 function renderTournamentPage(){
+  renderTimersPanel();
   renderViewTabs();
   if(ST.activeView==='pools') renderPoolsView();
   else renderBracketView();
@@ -3552,6 +3565,7 @@ function stopTVAutoScroll(){
 function renderTVPage(){
   renderTVSettingsUI();
   renderTVContent();
+  renderTVTimers();
 }
 function renderTVSettingsUI(){
   const cfg = getTVSettings();
@@ -4099,42 +4113,240 @@ window.submitRoster = async function(teamId){
 };
 
 
+// ══════════════════════════════════════════════════════════
+// CHRONOS SYNCHRONISÉS — 1 chrono général OU 1 chrono par terrain
+// ──────────────────────────────────────────────────────────
+// L'état des chronos est stocké dans Firestore (foottournoi/current, champ
+// "timers") et NON plus dans le navigateur de l'admin. Chaque appareil
+// (admin, scorer, spectateur, écran TV) calcule lui-même le temps restant à
+// partir d'un instant de fin "endAt" exprimé en HEURE SERVEUR : tous les
+// affichages sont donc identiques à la seconde près, même si l'horloge d'un
+// téléphone est déréglée (cf. syncClock). Les commandes (Match, Transition,
+// Pause, Reprendre, Reset) sont réservées à l'admin et aux scorers.
+//
+//  timers = { split:bool, items:{ all:{…} | '1':{…}, '2':{…} … } }
+//  item   = { mode:'match'|'trans', status:'idle'|'running'|'paused',
+//             durMs, endAt (ms, heure serveur), remainMs (si pause), seq }
+// ══════════════════════════════════════════════════════════
 function fmt(s){ return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0'); }
 function currentMatchDuration(){
   return ST.activeView==='bracket' ? (ST.cfg.matchDurBracket||12) : (ST.cfg.matchDur||12);
 }
-function updateTimerDisplay(){
-  const el=document.getElementById('tmrDsp'); if(!el) return;
-  const s=ST.timerSec;
-  el.textContent=fmt(s);
-  el.className='timer-big '+(s===0?'tc-zero':ST.timerMode==='match'?'tc-match':'tc-trans');
-  const lblEl=document.getElementById('tmrLbl');
-  if(lblEl) lblEl.textContent=ST.timerMode==='match'?`⏱ MATCH — ${currentMatchDuration()} min`:`⏸ TRANSITION — ${ST.cfg.tt} min`;
-  if(ST.timerRun){ if(s===0) _playSiren(2.5,0.9); else if(s===30) _playWarn30(); else if(s>=1&&s<=5) _playCountdownBeep(s===1); }
+
+// ── Horloge serveur ──────────────────────────────────────
+let CLOCK_OFFSET = 0, CLOCK_SYNCED = false, CLOCK_RTT = null;
+function serverNow(){ return Date.now() + CLOCK_OFFSET; }
+// Mesure l'écart entre l'horloge de CET appareil et celle des serveurs Google
+// (champ "readTime" d'une lecture Firestore REST), en compensant le temps
+// d'aller-retour. Si la mesure échoue (réseau, restrictions de clé API…), on
+// retombe sur l'horloge de l'appareil : généralement fiable (réglée par le réseau).
+window.syncClock = async function(){
+  const proj = firebaseConfig.projectId, key = firebaseConfig.apiKey;
+  const base = `projects/${proj}/databases/(default)/documents`;
+  const url  = `https://firestore.googleapis.com/v1/${base}:batchGet?key=${encodeURIComponent(key)}`;
+  const body = JSON.stringify({ documents:[`${base}/foottournoi/status`] });
+  const headers = { 'Content-Type':'application/json' };
+  try { if(auth.currentUser) headers.Authorization = 'Bearer ' + await auth.currentUser.getIdToken(); } catch(e){}
+  let best = null;
+  for(let i=0;i<3;i++){
+    try {
+      const ctl = new AbortController(); const to = setTimeout(()=>ctl.abort(), 4000);
+      const t0 = Date.now();
+      const res = await fetch(url, { method:'POST', headers, body, signal:ctl.signal, cache:'no-store' });
+      const t1 = Date.now(); clearTimeout(to);
+      if(!res.ok) throw new Error('HTTP '+res.status);
+      const arr = await res.json();
+      const rt = arr && arr[0] && arr[0].readTime; if(!rt) throw new Error('no readTime');
+      const srv = Date.parse(String(rt).replace(/(\.\d{3})\d+/, '$1'));
+      if(isNaN(srv)) throw new Error('bad readTime');
+      const rtt = t1 - t0;
+      if(!best || rtt < best.rtt) best = { rtt, offset: srv - (t0+t1)/2 };
+    } catch(e){ break; }
+  }
+  if(best && best.rtt < 3000){ CLOCK_OFFSET = Math.round(best.offset); CLOCK_RTT = best.rtt; CLOCK_SYNCED = true; }
+  updateClockBadge();
+};
+function updateClockBadge(){
+  const el = document.getElementById('tmrSync'); if(!el) return;
+  if(CLOCK_SYNCED){
+    const o = CLOCK_OFFSET, abs = Math.abs(o);
+    const off = abs < 300 ? 'horloge de cet appareil à l\'heure' : `cet appareil est ${o>0?'en retard':'en avance'} de ${(abs/1000).toFixed(1)} s (corrigé)`;
+    el.textContent = `🕐 Synchronisé sur l'heure serveur — ${off}`;
+  } else {
+    el.textContent = '🕐 Heure de l\'appareil utilisée (synchro serveur indisponible)';
+  }
 }
-window.startTimer = function(mode){
-  if(!isAdmin()) return;
-  _unlockAudio(); clearInterval(ST.timerIv); ST.timerMode=mode;
-  const secs = mode==='match' ? currentMatchDuration() : (ST.cfg.tt||4);
-  ST.timerSec=secs*60; ST.timerRun=true; updateTimerDisplay();
-  const p=document.getElementById('tmrP'), r=document.getElementById('tmrR');
-  if(p) p.style.display=''; if(r) r.style.display='none';
-  ST.timerIv=setInterval(()=>{ if(ST.timerSec>0){ ST.timerSec--;updateTimerDisplay(); } else { clearInterval(ST.timerIv);ST.timerRun=false; const p2=document.getElementById('tmrP'); if(p2) p2.style.display='none'; } },1000);
-};
-window.pauseTimer = function(){
-  if(!isAdmin()) return;
-  clearInterval(ST.timerIv);ST.timerRun=false;
-  const p=document.getElementById('tmrP'), r=document.getElementById('tmrR');
-  if(p) p.style.display='none'; if(r) r.style.display='';
-};
-window.resumeTimer = function(){
-  if(!isAdmin()) return;
+
+// ── État ─────────────────────────────────────────────────
+const IDLE_TIMER = { mode:'match', status:'idle', durMs:0, endAt:0, remainMs:0, seq:0 };
+function sanitizeTimers(raw){
+  const out = { split:false, items:{} };
+  if(!raw || typeof raw!=='object') return out;
+  out.split = raw.split === true;
+  const it = (raw.items && typeof raw.items==='object') ? raw.items : {};
+  Object.keys(it).forEach(k=>{
+    const t = it[k]; if(!t || typeof t!=='object') return;
+    out.items[k] = {
+      mode: t.mode==='trans' ? 'trans' : 'match',
+      status: (t.status==='running'||t.status==='paused') ? t.status : 'idle',
+      durMs: Math.max(0, +t.durMs||0), endAt: +t.endAt||0, remainMs: Math.max(0, +t.remainMs||0), seq: +t.seq||0
+    };
+  });
+  return out;
+}
+function timerKeys(){
+  if(!ST.timers.split) return ['all'];
+  const n = Math.max(1, +ST.cfg.courts || 1);
+  return Array.from({length:n}, (_,i)=>String(i+1));
+}
+// state : 'idle' | 'running' | 'paused' | 'done' (temps écoulé)
+function timerView(key){
+  const t = ST.timers.items[key] || IDLE_TIMER;
+  let remMs = 0;
+  if(t.status==='running') remMs = Math.max(0, t.endAt - serverNow());
+  else if(t.status==='paused') remMs = t.remainMs;
+  const rem = Math.ceil(remMs/1000);
+  const state = (t.status==='running' && rem<=0) ? 'done' : t.status;
+  return { t, rem, state };
+}
+function timerStateLabel(v, short){
+  if(short) return { idle:'', running:'▶', paused:'⏸', done:'✔' }[v.state];
+  if(v.state==='idle') return 'Prêt';
+  const base = v.t.mode==='match' ? 'MATCH' : 'TRANSITION';
+  if(v.state==='paused') return `⏸ ${base} en pause`;
+  if(v.state==='done')   return `✔ ${base} terminé`;
+  return `${v.t.mode==='match'?'⏱':'⏸'} ${base} — ${Math.round(v.t.durMs/6000)/10} min`;
+}
+const TMR_CLASSES = ['tc-match','tc-trans','tc-zero','tc-paused','tc-idle'];
+function timerDigitClasses(v){
+  if(v.state==='idle') return ['tc-idle'];
+  if(v.state==='done') return ['tc-zero'];
+  const c = v.t.mode==='match' ? 'tc-match' : 'tc-trans';
+  return v.state==='paused' ? [c,'tc-paused'] : [c];
+}
+
+// ── Commandes (admin + scorers) ──────────────────────────
+function canControlTimer(){ return isScorer(); }
+function buildTimerPatch(key, action){
+  const cur = ST.timers.items[key] || IDLE_TIMER, v = timerView(key), now = serverNow(), seq = (cur.seq||0)+1;
+  if(action==='match' || action==='trans'){
+    const durMs = (action==='match' ? currentMatchDuration() : (ST.cfg.tt||4)) * 60000;
+    return { mode:action, status:'running', durMs, endAt:now+durMs, remainMs:durMs, seq };
+  }
+  if(action==='pause'){
+    if(v.state!=='running') return null;
+    return { ...cur, status:'paused', endAt:0, remainMs:Math.max(0, cur.endAt-now), seq };
+  }
+  if(action==='resume'){
+    if(cur.status!=='paused') return null;
+    return { ...cur, status:'running', endAt:now+cur.remainMs, seq };
+  }
+  if(action==='reset') return { mode:'match', status:'idle', durMs:0, endAt:0, remainMs:0, seq };
+  return null;
+}
+async function tmrApply(patches, extra){
+  if(!canControlTimer()) return;
   _unlockAudio();
-  const p=document.getElementById('tmrP'), r=document.getElementById('tmrR');
-  if(p) p.style.display=''; if(r) r.style.display='none';
-  ST.timerRun=true;
-  ST.timerIv=setInterval(()=>{ if(ST.timerSec>0){ ST.timerSec--;updateTimerDisplay(); } else { clearInterval(ST.timerIv);ST.timerRun=false; const p2=document.getElementById('tmrP'); if(p2) p2.style.display='none'; } },1000);
+  const items = {};
+  Object.keys(patches).forEach(k=>{ if(patches[k]) items[k] = patches[k]; });
+  if(!Object.keys(items).length && !extra) return;
+  Object.keys(items).forEach(k=>{ ST.timers.items[k] = items[k]; }); // affichage immédiat
+  if(extra && 'split' in extra) ST.timers.split = extra.split;
+  renderTimersUI();
+  // Un seul écriture pour tous les chronos concernés : ils partent au même instant.
+  await saveTournament({ timers:{ ...(extra||{}), items } });
+}
+window.tmrAct   = function(key, action){ tmrApply({ [key]: buildTimerPatch(key, action) }); };
+window.tmrGroup = function(action){ const p = {}; timerKeys().forEach(k=>{ p[k] = buildTimerPatch(k, action); }); tmrApply(p); };
+window.tmrSetSplit = async function(split){
+  if(!canControlTimer() || ST.timers.split === split) return;
+  const old = timerKeys().filter(k=>timerView(k).state!=='idle');
+  if(old.length && !confirm('Des chronos sont en cours ou en pause : ils seront remis à zéro si vous changez de mode. Continuer ?')) return;
+  const p = {}; old.forEach(k=>{ p[k] = buildTimerPatch(k,'reset'); });
+  await tmrApply(p, { split });
 };
+async function tmrResetAll(){
+  const p = {}; Object.keys(ST.timers.items).forEach(k=>{ p[k] = buildTimerPatch(k,'reset'); });
+  await tmrApply(p, { split:false });
+}
+
+// ── Affichage ────────────────────────────────────────────
+function timerCardHTML(key, size){
+  const ctl = canControlTimer();
+  const btns = ctl ? `<div class="tmr-btns">
+      <button class="btn btn-g btn-xs" onclick="tmrAct('${key}','match')">▶ Match</button>
+      <button class="btn btn-ghost btn-xs" onclick="tmrAct('${key}','trans')">⏸ Transition</button>
+      <button class="btn btn-ghost btn-xs tmr-b-pause" onclick="tmrAct('${key}','pause')">⏸ Pause</button>
+      <button class="btn btn-ghost btn-xs tmr-b-resume" onclick="tmrAct('${key}','resume')">▶ Reprendre</button>
+      <button class="btn btn-ghost btn-xs tmr-b-reset" onclick="tmrAct('${key}','reset')">⏹ Reset</button>
+    </div>` : '';
+  return `<div class="tmr-card tmr-${size}" data-tmr-card="${key}" data-state="idle">
+    <div class="tmr-head"><span class="tmr-name">${key==='all' ? '⏱ Chrono général — tous les terrains' : '⏱ Terrain '+key}</span><span class="tmr-st" data-tmr-st="${key}"></span></div>
+    <div class="timer-big tmr-digits" data-tmr="${key}">00:00</div>${btns}</div>`;
+}
+function renderTimersPanel(){
+  const el = document.getElementById('timersPanel'); if(!el) return;
+  const ctl = canControlTimer(), split = ST.timers.split;
+  let html = `<div class="tmr-panel"><div class="tmr-top"><div class="tmr-ttl">⏱ Chronomètre${split?'s par terrain':''}</div>`;
+  if(ctl) html += `<div class="tmr-modes">
+      <button class="btn btn-xs ${!split?'btn-g':'btn-ghost'}" onclick="tmrSetSplit(false)">Un chrono pour tous</button>
+      <button class="btn btn-xs ${split?'btn-g':'btn-ghost'}" onclick="tmrSetSplit(true)">Un chrono par terrain</button>
+      <button class="btn btn-ghost btn-xs snd-btn" onclick="toggleSound()" title="Activer/couper le son">${_soundEnabled?'🔊':'🔇'}</button>
+    </div>`;
+  html += `</div>`;
+  if(ctl && split) html += `<div class="tmr-group"><strong>Tous les terrains :</strong>
+      <button class="btn btn-g btn-xs" onclick="tmrGroup('match')">▶ Match</button>
+      <button class="btn btn-ghost btn-xs" onclick="tmrGroup('trans')">⏸ Transition</button>
+      <button class="btn btn-ghost btn-xs" onclick="tmrGroup('pause')">⏸ Pause</button>
+      <button class="btn btn-ghost btn-xs" onclick="tmrGroup('resume')">▶ Reprendre</button>
+      <button class="btn btn-ghost btn-xs" onclick="tmrGroup('reset')">⏹ Reset</button></div>`;
+  html += `<div class="tmr-grid ${split?'tmr-grid-split':''}">${timerKeys().map(k=>timerCardHTML(k, split?'sm':'lg')).join('')}</div>`;
+  if(ctl) html += `<div class="tmr-sync" id="tmrSync"></div>`;
+  el.innerHTML = html + `</div>`;
+  updateClockBadge();
+  tickTimers(true);
+}
+// Bande de chronos de l'écran TV (masquée tant qu'aucun chrono n'a démarré)
+function renderTVTimers(){
+  const el = document.getElementById('tvTimers'); if(!el) return;
+  const keys = timerKeys();
+  if(!keys.some(k=>timerView(k).state!=='idle')){ el.style.display='none'; el.innerHTML=''; return; }
+  el.style.display = 'flex';
+  el.innerHTML = ST.timers.split
+    ? keys.map(k=>`<div class="tvt" data-tmr-card="${k}" data-state="idle"><span class="tvt-name">T${k}</span><span class="tmr-digits tvt-dig" data-tmr="${k}">00:00</span><span class="tvt-ic" data-tmr-st="${k}" data-short="1"></span></div>`).join('')
+    : `<div class="tvt tvt-big" data-tmr-card="all" data-state="idle"><span class="tvt-name">⏱</span><span class="tmr-digits tvt-dig" data-tmr="all">00:00</span><span class="tvt-lbl" data-tmr-st="all"></span></div>`;
+  tickTimers(true);
+}
+function renderTimersUI(){ renderTimersPanel(); renderTVTimers(); }
+
+// ── Boucle d'affichage + sons (250 ms) ───────────────────
+const _tmrLast = {};
+function shouldPlayTimerSound(){ return _soundEnabled && (ST.page==='TV' || isScorer()); }
+function tickTimers(silent){
+  document.querySelectorAll('[data-tmr]').forEach(el=>{
+    const v = timerView(el.dataset.tmr), txt = fmt(v.rem), want = timerDigitClasses(v);
+    if(el.textContent!==txt) el.textContent = txt;
+    TMR_CLASSES.forEach(c=>el.classList.toggle(c, want.includes(c)));
+  });
+  document.querySelectorAll('[data-tmr-card]').forEach(el=>{
+    const st = timerView(el.dataset.tmrCard).state;
+    if(el.dataset.state!==st) el.dataset.state = st;
+  });
+  document.querySelectorAll('[data-tmr-st]').forEach(el=>{
+    const txt = timerStateLabel(timerView(el.dataset.tmrSt), !!el.dataset.short);
+    if(el.textContent!==txt) el.textContent = txt;
+  });
+  // Sons : détectés sur les changements de seconde d'un chrono déjà en cours
+  const ev = new Set();
+  Object.keys(ST.timers.items).forEach(k=>{
+    const v = timerView(k), active = (v.state==='running'||v.state==='done'), prev = _tmrLast[k];
+    _tmrLast[k] = active ? { rem:v.rem, seq:v.t.seq } : null;
+    if(!active || !prev || prev.seq!==v.t.seq || prev.rem===v.rem) return;
+    if(v.rem===0) ev.add('siren'); else if(v.rem===30) ev.add('w30'); else if(v.rem===1) ev.add('last'); else if(v.rem>=2 && v.rem<=5) ev.add('beep');
+  });
+  if(silent || !ev.size || !shouldPlayTimerSound()) return;
+  if(ev.has('siren')) _playSiren(2.5,0.9); else if(ev.has('w30')) _playWarn30(); else if(ev.has('last')) _playCountdownBeep(true); else _playCountdownBeep(false);
+}
 
 // ── AUDIO (Web Audio API — sirène fin de match, alertes) ────
 let _AC=null, _soundEnabled=true;
@@ -4144,13 +4356,20 @@ function _playSiren(durationSec=2.5,vol=0.9){ const ac=_getAC(); if(!ac||!_sound
 function _playWarn30(){ if(!_soundEnabled) return; for(let rep=0;rep<2;rep++){ _playTone(880,0.12,'sine',0.005,0.75,rep*0.55); _playTone(1100,0.15,'sine',0.005,0.75,rep*0.55+0.18); } }
 function _playCountdownBeep(isLast){ if(!_soundEnabled) return; if(isLast){ _playTone(660,0.08,'square',0.005,0.8);_playTone(880,0.10,'square',0.005,0.8,0.12); }else _playTone(660,0.08,'square',0.005,0.65); }
 function _unlockAudio(){ _getAC(); const ac=_AC; if(!ac) return; const buf=ac.createBuffer(1,1,22050); const src=ac.createBufferSource(); src.buffer=buf;src.connect(ac.destination);src.start(0); }
-window.toggleSound = function(){ _soundEnabled=!_soundEnabled; const btn=document.getElementById('soundToggle'); if(btn) btn.textContent=_soundEnabled?'🔊':'🔇'; _getAC(); };
+window.toggleSound = function(){ _soundEnabled=!_soundEnabled; document.querySelectorAll('.snd-btn').forEach(b=>{ b.textContent=_soundEnabled?'🔊':'🔇'; }); _getAC(); };
 
 // ══════════════════════════════════════════════════════════
 // INIT
 // ══════════════════════════════════════════════════════════
 document.addEventListener('DOMContentLoaded', ()=>{
   if(typeof onCfgChange==='function') onCfgChange();
+  // Chronos : synchro d'horloge serveur (+ rafraîchie régulièrement) et boucle d'affichage
+  syncClock();
+  setInterval(syncClock, 5*60*1000);
+  setInterval(()=>tickTimers(false), 250);
+  document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible'){ syncClock(); tickTimers(true); } });
+  // Les navigateurs exigent un 1er geste (clic/toucher) avant de laisser jouer du son (écran TV compris)
+  document.addEventListener('pointerdown', ()=>{ try{ _unlockAudio(); }catch(e){} }, { once:true });
 });
 </script>
 
@@ -4289,6 +4508,43 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
 .timer-big.tc-trans{ color:#b8720a; }
 .timer-big.tc-zero{ color:#b02018;animation:blink 1s ease-in-out infinite; }
 .timer-btns{ display:flex;flex-direction:column;gap:7px;align-items:flex-end; }
+
+/* ── CHRONOS SYNCHRONISÉS (page Tournoi) ─────────────── */
+.tmr-panel{ background:var(--s2);border-radius:var(--r);padding:14px 18px;margin-bottom:18px;box-shadow:var(--shadow2); }
+.tmr-top{ display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:10px; }
+.tmr-ttl{ font-family:'Oswald',sans-serif;font-size:14px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted); }
+.tmr-modes{ display:flex;gap:6px;flex-wrap:wrap; }
+.tmr-group{ display:flex;gap:6px;flex-wrap:wrap;align-items:center;font-size:12px;margin-bottom:10px;padding:8px 10px;background:rgba(0,0,0,.05);border-radius:8px; }
+.tmr-grid{ display:grid;gap:10px;grid-template-columns:1fr; }
+.tmr-grid-split{ grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); }
+.tmr-card{ border:1px solid var(--bdr);border-radius:12px;padding:10px 14px;background:rgba(255,255,255,.6); }
+.tmr-head{ display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap; }
+.tmr-name{ font-weight:700;font-size:12px;letter-spacing:.5px; }
+.tmr-st{ font-size:11px;color:var(--muted); }
+.tmr-card .timer-big{ font-size:38px;letter-spacing:-1px; }
+.tmr-card.tmr-lg .timer-big{ font-size:64px;letter-spacing:-2px; }
+.timer-big.tc-idle{ color:var(--muted);opacity:.55; }
+.timer-big.tc-paused{ opacity:.6; }
+.tmr-btns{ display:flex;gap:6px;flex-wrap:wrap;margin-top:8px; }
+.tmr-card:not([data-state="running"]) .tmr-b-pause{ display:none; }
+.tmr-card:not([data-state="paused"]) .tmr-b-resume{ display:none; }
+.tmr-card[data-state="idle"] .tmr-b-reset{ display:none; }
+.tmr-sync{ margin-top:10px;font-size:10px;color:var(--muted); }
+/* ── CHRONOS (écran TV) ──────────────────────────────── */
+#tvTimers{ display:none;flex-wrap:wrap;justify-content:center;align-items:center;gap:clamp(8px,1.4vw,18px);padding:clamp(6px,1.2vh,14px) clamp(16px,3vw,40px);border-bottom:2px solid rgba(255,255,255,.08);flex-shrink:0; }
+.tvt{ display:flex;align-items:center;gap:10px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.18);border-radius:14px;padding:4px 16px; }
+.tvt-name{ font-family:'Oswald',sans-serif;font-weight:700;font-size:clamp(14px,1.8vw,24px);color:#ffd27a; }
+.tvt-dig{ font-family:'Oswald',sans-serif;font-weight:700;font-size:clamp(26px,4vw,58px);line-height:1.1;font-variant-numeric:tabular-nums; }
+.tvt-ic{ font-size:clamp(14px,1.8vw,24px);min-width:1ch; }
+.tvt-lbl{ font-family:'Oswald',sans-serif;font-size:clamp(14px,1.8vw,26px);letter-spacing:1px;color:rgba(255,255,255,.8); }
+.tvt-big{ padding:2px 28px;gap:clamp(12px,2vw,28px); }
+.tvt-big .tvt-dig{ font-size:clamp(48px,10vh,130px); }
+.tvt-big .tvt-name{ font-size:clamp(28px,5vh,60px); }
+#tvTimers .tmr-digits.tc-match{ color:#7affa0; }
+#tvTimers .tmr-digits.tc-trans{ color:#ffd27a; }
+#tvTimers .tmr-digits.tc-zero{ color:#ff6b5e;animation:blink 1s ease-in-out infinite; }
+#tvTimers .tmr-digits.tc-idle{ color:rgba(255,255,255,.3); }
+#tvTimers .tmr-digits.tc-paused{ opacity:.55; }
 
 /* ── STANDINGS ───────────────────────────────────────── */
 .stbl{ width:100%;border-collapse:collapse;font-size:13px; }
@@ -4871,24 +5127,8 @@ body.tv-mode .hdr-drawer-overlay{ display:none!important; }
 <div class="wrap">
   <div class="sec-ttl">⚽ Tournoi en direct</div>
 
-  <!-- CHRONO MATCH -->
-  <div class="timer-wrap" data-role="admin">
-    <div>
-      <div class="timer-lbl" id="tmrLbl">⏱ MATCH</div>
-      <div class="timer-big tc-match" id="tmrDsp">00:00</div>
-    </div>
-    <div class="timer-btns">
-      <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end">
-        <button class="btn btn-g btn-sm" onclick="startTimer('match')">▶ Match</button>
-        <button class="btn btn-ghost btn-sm" onclick="startTimer('trans')">⏸ Transition</button>
-        <button class="btn btn-ghost btn-xs" id="soundToggle" onclick="toggleSound()" title="Activer/couper le son">🔊</button>
-      </div>
-      <div style="display:flex;gap:6px">
-        <button class="btn btn-ghost btn-xs" id="tmrP" onclick="pauseTimer()" style="display:none">⏸</button>
-        <button class="btn btn-ghost btn-xs" id="tmrR" onclick="resumeTimer()" style="display:none">▶ Reprendre</button>
-      </div>
-    </div>
-  </div>
+  <!-- CHRONOS (visibles par tous ; commandes pour admin/scorer) -->
+  <div id="timersPanel"></div>
 
   <!-- Onglets vue Poules/Finale -->
   <div class="rtabs" id="viewTabs"></div>
@@ -5051,6 +5291,7 @@ body.tv-mode .hdr-drawer-overlay{ display:none!important; }
     <div class="tv-phase-badge" id="tvPhaseBadge">—</div>
     <div class="tv-clock" id="tvClock">--:--:--</div>
   </div>
+  <div id="tvTimers"></div>
   <div class="tv-sub-ttl" id="tvSubTitle">⚽ Résultats en direct</div>
   <div class="tv-body" id="tvContent"></div>
 
@@ -5069,6 +5310,7 @@ body.tv-mode .hdr-drawer-overlay{ display:none!important; }
     <label id="tvIntervalStandingsWrap">🏆 Classement : <input type="number" id="tvIntervalStandingsInput" min="5" max="180" value="20" style="width:55px"
       onchange="tvSetIntervalStandings(this.value)"> sec</label>
     <label><input type="checkbox" id="tvScrollToggle" checked onchange="tvSetScroll(this.checked)"> 🔃 Défilement auto</label>
+    <button class="snd-btn" onclick="toggleSound()" title="Activer/couper le son (sirène, bips)">🔊</button>
     <button onclick="tvToggleFullscreen()">⛶ Plein écran</button>
     <button onclick="tvToggleHidden()">🙈 Masquer la barre</button>
     <button data-role="scorer" style="display:none" onclick="openMessagesModal()">📢 Messages</button>
