@@ -4151,6 +4151,7 @@ function applyTimersFromStatus(d){
   ST.timers = {
     v: tm.v||0,
     mode: tm.mode==='perCourt' ? 'perCourt' : 'single',
+    tvSound: tm.tvSound===true,
     all: tm.all || null,
     courts: tm.courts || {}
   };
@@ -4189,6 +4190,10 @@ async function tmrMutate(fn){
     alert('Chrono non synchronisé : '+e.message+(String(e.code||'').includes('permission') ? '\n\nLes règles Firestore refusent l\'écriture sur foottournoi/status pour ce compte.' : ''));
   }
 }
+window.tmrToggleTvSound = function(){
+  if(!isAdmin()) return;
+  tmrMutate(n=>{ n.tvSound = !n.tvSound; });
+};
 window.tmrSetMode = function(mode){
   tmrMutate(n=>{ n.mode = (mode==='perCourt') ? 'perCourt' : 'single'; });
 };
@@ -4234,7 +4239,8 @@ function renderTimerPanel(){
     h += `<div class="tmr-top">
       <button class="btn btn-sm ${!per?'btn-g':'btn-ghost'}" onclick="tmrSetMode('single')">⏱ 1 chrono pour tous les terrains</button>
       <button class="btn btn-sm ${per?'btn-g':'btn-ghost'}" onclick="tmrSetMode('perCourt')">🏟️ 1 chrono par terrain</button>
-      <button class="btn btn-ghost btn-xs" id="soundToggle" onclick="toggleSound()" title="Activer/couper le son">${_soundEnabled?'🔊':'🔇'}</button>
+      <button class="btn btn-ghost btn-xs" id="soundToggle" onclick="toggleSound()" title="Activer/couper le son sur cet appareil">${_soundEnabled?'🔊':'🔇'}</button>
+      ${isAdmin() ? `<button class="btn ${ST.timers.tvSound?'btn-g':'btn-ghost'} btn-sm" onclick="tmrToggleTvSound()" title="Active ou coupe la sirène sur l'écran TV">📺 Son TV : ${ST.timers.tvSound?'activé':'coupé'}</button>` : ''}
     </div>`;
   }
   h += `<div class="tmr-grid ${per?'':'single'}">${shown.map(k=>tmrCardHTML(k,ctl,per)).join('')}</div>`;
@@ -4266,7 +4272,10 @@ function renderTVTimers(){
 // passage de seconde observé en direct (jamais en rejoignant un chrono déjà fini).
 const _tmrLast = {};
 function tmrSounds(){
-  if(!isScorer() || !_soundEnabled) return;
+  // Sur la page Écran (TV) : le son suit le réglage de l'admin (Son TV).
+  // Ailleurs : appareils admin/scorer, selon leur bouton 🔊/🔇 local.
+  const allowed = (ST.page==='TV') ? (ST.timers.tvSound===true) : (isScorer() && _soundEnabled);
+  if(!allowed){ for(const k in _tmrLast) delete _tmrLast[k]; return; }
   tmrKeys().forEach(k=>{
     const t = tmrGet(k);
     if(!t || t.st!=='run'){ delete _tmrLast[k]; return; }
@@ -4281,7 +4290,7 @@ function tmrSounds(){
 
 let _tmrSigDone = '';
 function timerTick(){
-  const sig = [ST.timers.mode, ST.cfg.courts||4, isScorer()?1:0, tmrKeys().map(k=>k+':'+tmrCls(tmrGet(k))).join(',')].join('|');
+  const sig = [ST.timers.mode, ST.timers.tvSound?1:0, ST.cfg.courts||4, isScorer()?1:0, isAdmin()?1:0, tmrKeys().map(k=>k+':'+tmrCls(tmrGet(k))).join(',')].join('|');
   if(sig !== _tmrSigDone){ _tmrSigDone = sig; renderTimerPanel(); renderTVTimers(); }
   document.querySelectorAll('[data-tmr]').forEach(el=>{
     const t = tmrGet(el.dataset.tmr);
@@ -4292,7 +4301,15 @@ function timerTick(){
     const txt = tmrLabel(tmrGet(el.dataset.tmrLbl)); if(el.textContent!==txt) el.textContent = txt;
   });
   tmrSounds();
+  const sb = document.getElementById('tvSndBtn');
+  if(sb){
+    const need = ST.page==='TV' && ST.timers.tvSound===true && !(_AC && _AC.state==='running');
+    const disp = need ? '' : 'none'; if(sb.style.display!==disp) sb.style.display = disp;
+  }
 }
+// Les navigateurs exigent un geste pour autoriser le son : un seul toucher sur l'écran TV suffit.
+window.tvUnlockSound = function(){ _unlockAudio(); _playTone(880,0.15,'sine',0.005,0.6); timerTick(); };
+document.addEventListener('pointerdown', ()=>{ if(ST.page==='TV' && ST.timers.tvSound===true) _unlockAudio(); }, true);
 setInterval(timerTick, 250);
 
 // ── AUDIO (Web Audio API — sirène fin de match, alertes) ────
@@ -4465,6 +4482,8 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
 .timer-big[data-state="zero"]{ color:#b02018;animation:blink 1s ease-in-out infinite; }
 .timer-big[data-state="idle"]{ color:var(--muted); }
 
+.tv-snd{ margin-left:auto;background:#ffd27a;color:#3a2a00;border:0;border-radius:30px;padding:8px 18px;font-family:'Oswald',sans-serif;font-size:clamp(12px,1.4vw,18px);cursor:pointer;animation:blink 1.4s ease-in-out infinite; }
+.tv-snd + .tv-clock{ margin-left:0; }
 .tv-tmr-bar{ display:flex;flex-wrap:wrap;justify-content:center;gap:clamp(8px,1.4vw,18px);padding:clamp(6px,1.2vh,14px) clamp(16px,4vw,60px);flex-shrink:0;border-bottom:1px solid rgba(255,255,255,.1); }
 .tv-tmr{ background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.2);border-radius:14px;padding:6px clamp(14px,2vw,28px);text-align:center;min-width:clamp(120px,14vw,200px); }
 .tv-tmr-l{ font-family:'Oswald',sans-serif;font-size:clamp(11px,1.2vw,16px);letter-spacing:1.5px;color:rgba(255,255,255,.6);text-transform:uppercase; }
@@ -5219,6 +5238,7 @@ body.tv-mode .hdr-drawer-overlay{ display:none!important; }
   <div class="tv-hdr">
     <div class="tv-brand">⚽ Challenge Inter-Entreprises</div>
     <div class="tv-phase-badge" id="tvPhaseBadge">—</div>
+    <button class="tv-snd" id="tvSndBtn" style="display:none" onclick="tvUnlockSound()">🔇 Toucher pour activer le son</button>
     <div class="tv-clock" id="tvClock">--:--:--</div>
   </div>
   <div class="tv-tmr-bar" id="tvTimerBar" style="display:none"></div>
