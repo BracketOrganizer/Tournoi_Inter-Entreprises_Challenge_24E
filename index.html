@@ -76,7 +76,7 @@ let tvLastPhase = null; // dernière phase connue, pour repartir au 1er écran s
 
 const ST = {
   page:1, prevPage:1, rulesOpen:false,
-  teams:[],        // [{id,name,club,lv,respNom,respTel}]  -- 24 équipes inter-entreprises
+  teams:[],        // [{id,name,club,respNom,respTel}]  -- 24 équipes inter-entreprises
   pools:{A:[],B:[],C:[],D:[]}, // ids d'équipes par poule (6 équipes par poule)
   poolSchedule:[], // matchs de phase de poules [{m,pool,a,b,time,court}]
   poolTabSlot:null,    // créneau "TAB possible" réservé en fin de phase de poules {time,slot}
@@ -2178,7 +2178,7 @@ window.submitManualRegistration = async function(){
   const btn = document.getElementById('rm_submit'); if(btn) btn.disabled = true;
   setMsg('⏳ Inscription en cours…');
   try {
-    const newTeams = names.map(n=>({ id:'t_'+Date.now()+'_'+Math.random().toString(36).slice(2,6), name:n, club, lv:3, respNom:name, respTel:phone, respEmail:email }));
+    const newTeams = names.map(n=>({ id:'t_'+Date.now()+'_'+Math.random().toString(36).slice(2,6), name:n, club, respNom:name, respTel:phone, respEmail:email }));
     ST.teams.push(...newTeams);
     await saveTournament({ teams: ST.teams });
     const warn = [];
@@ -2249,7 +2249,7 @@ window.approveExtraTeamRequest = async function(uid){
       return;
     }
     const id = 't_'+Date.now()+'_'+Math.random().toString(36).slice(2,6);
-    ST.teams.push({ id, name: u.pendingExtraTeamRequest.name, club, lv:3, respNom: u.name, respTel: u.phone, respEmail: u.email });
+    ST.teams.push({ id, name: u.pendingExtraTeamRequest.name, club, respNom: u.name, respTel: u.phone, respEmail: u.email });
     await saveTournament({ teams: ST.teams });
     try { await setDoc(doc(db,'teamRosters',id), { players: [], updatedAt: serverTimestamp() }); }
     catch(e){ console.warn('Création teamRosters (2e équipe) échouée (non bloquant)', e); }
@@ -2296,7 +2296,7 @@ window.approveRegistration = async function(uid){
       alert(`Refusé : le club "${club}" est limité à ${maxPerClub} équipe${maxPerClub>1?'s':''} (déjà ${already} inscrite${already>1?'s':''}, ${names.length} demandée${names.length>1?'s':''}). Décochez des équipes, changez la limite pour ce club, ou refusez l'inscription.`);
       return;
     }
-    const newTeams = names.map(n=>({ id:'t_'+Date.now()+'_'+Math.random().toString(36).slice(2,6), name:n, club, lv:3, respNom:r.name, respTel:r.phone, respEmail:r.email }));
+    const newTeams = names.map(n=>({ id:'t_'+Date.now()+'_'+Math.random().toString(36).slice(2,6), name:n, club, respNom:r.name, respTel:r.phone, respEmail:r.email }));
     ST.teams.push(...newTeams);
     await saveTournament({ teams: ST.teams });
     for(const t of newTeams){
@@ -3227,7 +3227,7 @@ function renderTeamsPage(){
           <span style="font-family:'Oswald',sans-serif;font-size:15px;color:var(--dim);min-width:26px">${i+1}</span>
           <div style="flex:1;min-width:0">
             <div style="font-weight:700;color:var(--ink)">${t.name} ${t.club&&t.club!==t.name?`<span class="t-club-badge">${t.club}</span>`:''}</div>
-            <div style="font-size:11px;color:var(--muted)">${'⭐'.repeat(t.lv||1)}${t.respNom?` · 🛡️ ${t.respNom}`:''}${t.respTel?` · 📞 ${t.respTel}`:''}</div>
+            <div style="font-size:11px;color:var(--muted)">${[t.respNom?'🛡️ '+t.respNom:'', t.respTel?'📞 '+t.respTel:''].filter(Boolean).join(' · ')}</div>
           </div>
           ${isAdmin()?`<button onclick="openEditTeam('${t.id}')" style="background:none;border:1px solid var(--blu);color:var(--blu);border-radius:5px;padding:2px 8px;cursor:pointer;font-size:11px;margin-right:4px">✏️</button><button onclick="removeTeam('${t.id}')" style="background:none;border:1px solid var(--red);color:var(--red);border-radius:5px;padding:2px 8px;cursor:pointer;font-size:11px">✕</button>`:''}
         </div>`).join('');
@@ -3241,7 +3241,6 @@ window.addTeam = async function(){
   if(ST.teams.length>=24){ alert('Le tournoi est limité à 24 équipes (format officiel).'); return; }
   const name = document.getElementById('t_name').value.trim();
   const club = document.getElementById('t_club').value.trim() || name;
-  const lv   = +document.getElementById('t_lv').value || 3;
   const respNom = document.getElementById('t_resp').value.trim();
   const respTel = document.getElementById('t_tel').value.trim();
   if(!name){ alert('Le nom de l\'équipe est obligatoire.'); return; }
@@ -3251,7 +3250,7 @@ window.addTeam = async function(){
     return;
   }
   const id = 't_'+Date.now()+'_'+Math.random().toString(36).slice(2,6);
-  ST.teams.push({ id, name, club, lv, respNom, respTel });
+  ST.teams.push({ id, name, club, respNom, respTel });
   await saveTournament({ teams: ST.teams });
   // Crée le doc teamRosters vide associé : nécessaire pour que le futur responsable
   // d'équipe (manager) puisse ensuite faire un update (et non un create, qui lui
@@ -3288,7 +3287,7 @@ window.autoFillTeams = async function(){
     const ent = clubs[i%clubs.length];
     const respNom = prenoms[i%prenoms.length]+' '+noms[i%noms.length];
     const respTel = '06'+String(10000000+i*1111111).slice(0,8);
-    ST.teams.push({ id:'t_auto_'+i, name: ent, club: ent, lv: (i%5)+1, respNom, respTel });
+    ST.teams.push({ id:'t_auto_'+i, name: ent, club: ent, respNom, respTel });
   }
   await saveTournament({ teams: ST.teams });
   // Crée les docs teamRosters vides associés (cf. note dans addTeam()).
@@ -3303,7 +3302,6 @@ window.openEditTeam = function(id){
   document.getElementById('edit_team_id').value=t.id;
   document.getElementById('edit_t_name').value=t.name;
   document.getElementById('edit_t_club').value=t.club||'';
-  document.getElementById('edit_t_lv').value=t.lv||3;
   document.getElementById('edit_t_resp').value=t.respNom||'';
   document.getElementById('edit_t_tel').value=t.respTel||'';
   document.getElementById('editTeamOverlay').style.display='flex';
@@ -3315,11 +3313,10 @@ window.saveEditTeam = async function(){
   const t=ST.teams.find(x=>x.id===id); if(!t) return;
   const name=document.getElementById('edit_t_name').value.trim();
   const club=document.getElementById('edit_t_club').value.trim()||name;
-  const lv=+document.getElementById('edit_t_lv').value||3;
   const respNom=document.getElementById('edit_t_resp').value.trim();
   const respTel=document.getElementById('edit_t_tel').value.trim();
   if(!name){ alert('Le nom est obligatoire.'); return; }
-  t.name=name; t.club=club; t.lv=lv; t.respNom=respNom; t.respTel=respTel;
+  t.name=name; t.club=club; t.respNom=respNom; t.respTel=respTel;
   await saveTournament({ teams: ST.teams });
   closeEditTeam(); renderTeamsPage();
   if(ST.poolSchedule.length){ renderPlanningPreview(); }
@@ -5210,6 +5207,17 @@ body.tv-mode .hdr-drawer-overlay{ display:none!important; }
 .msg-item{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:8px; border:1px solid var(--bdr); border-radius:8px; background:var(--s0); }
 @keyframes blink{ 0%,100%{opacity:1}50%{opacity:.4} }
 
+/* ── Cases à cocher d'arbitrage (Configuration) : grandes et faciles à toucher ── */
+#cfg_refon, #cfg_teamrefon{ width:24px!important; height:24px!important; min-width:24px; flex-shrink:0; accent-color:var(--grn); cursor:pointer; }
+label[for="cfg_refon"], label[for="cfg_teamrefon"]{ font-size:14px!important; text-transform:none!important; letter-spacing:0!important; line-height:1.35; }
+@media(max-width:767px){
+  #cfg_refon, #cfg_teamrefon{ width:34px!important; height:34px!important; min-width:34px; }
+  label[for="cfg_refon"], label[for="cfg_teamrefon"]{ font-size:16px!important; }
+  #cfg_refon, #cfg_teamrefon{ margin-right:2px; }
+  #cfg_refon:focus-visible, #cfg_teamrefon:focus-visible{ outline:3px solid var(--grn); outline-offset:2px; }
+  div:has(> #cfg_refon), div:has(> #cfg_teamrefon){ gap:12px!important; padding:10px 12px!important; background:var(--s2); border:1px solid var(--bdr); border-radius:10px; margin-bottom:6px; }
+}
+
 /* ── ADAPTATION MOBILE (≤ 767px) — ne change rien sur ordinateur / TV ───── */
 @media(max-width:767px){
   .wrap{ padding:14px 10px 80px; }
@@ -5706,13 +5714,6 @@ body.tv-mode .hdr-drawer-overlay{ display:none!important; }
           <label>Club / Référence (optionnel)</label>
           <input type="text" id="t_club" placeholder="Idem si vide">
         </div>
-        <div>
-          <label>Niveau</label>
-          <select id="t_lv" title="Niveau de l'équipe" aria-label="Niveau de l'équipe">
-            <option value="1">⭐</option><option value="2">⭐⭐</option>
-            <option value="3" selected>⭐⭐⭐</option><option value="4">⭐⭐⭐⭐</option><option value="5">⭐⭐⭐⭐⭐</option>
-          </select>
-        </div>
       </div>
       <div class="fr">
         <div>
@@ -5758,9 +5759,6 @@ body.tv-mode .hdr-drawer-overlay{ display:none!important; }
     <div class="fg">
       <div><label>Nom de l'équipe</label><input type="text" id="edit_t_name" title="Nom de l'équipe" aria-label="Nom de l'équipe"></div>
       <div><label>Club / Référence</label><input type="text" id="edit_t_club" title="Club ou référence" aria-label="Club ou référence"></div>
-      <div><label>Niveau</label>
-        <select id="edit_t_lv" title="Niveau de l'équipe" aria-label="Niveau de l'équipe"><option value="1">⭐</option><option value="2">⭐⭐</option><option value="3">⭐⭐⭐</option><option value="4">⭐⭐⭐⭐</option><option value="5">⭐⭐⭐⭐⭐</option></select>
-      </div>
       <div><label>Responsable d'équipe</label><input type="text" id="edit_t_resp" title="Responsable d'équipe" aria-label="Responsable d'équipe"></div>
       <div><label>N° de téléphone du responsable</label><input type="tel" id="edit_t_tel" title="Téléphone du responsable" aria-label="Téléphone du responsable"></div>
     </div>
