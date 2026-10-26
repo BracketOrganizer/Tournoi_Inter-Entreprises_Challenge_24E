@@ -2,8 +2,8 @@
 <html lang="fr">
 <head>
 <script>
-  if(!sessionStorage.getItem('_reloaded')){
-    sessionStorage.setItem('_reloaded','1');
+  if(!sessionStorage.getItem('_reloaded_chal24')){
+    sessionStorage.setItem('_reloaded_chal24','1');
     location.reload(true);
   }
 </script>
@@ -39,16 +39,10 @@ const firebaseConfig = {
   measurementId: "G-D6ZFZR3XJN"
 };
 // ⚠️ Remplacez les valeurs ci-dessus par celles de VOTRE projet Firebase.
-// Cette appli réutilise les MÊMES collections Firestore (foottournoi,
-// teamRosters, tag 'foot24') propre à cette application, pour
-// rester compatible avec vos règles de sécurité Firestore existantes sans
-// rien avoir à modifier dans la Console Firebase.
-// ⚠️ IMPORTANT : les deux tournois partagent donc le même document
-// 'foottournoi/current'. Ne faites JAMAIS tourner les deux applis en même
-// temps (saisie de scores, etc.) sous peine d'écraser les données de l'une
-// avec celles de l'autre. Si vous avez besoin d'une vraie séparation (les
-// deux événements en simultané), créez un second projet Firebase dédié et
-// mettez à jour ses règles de sécurité en conséquence — demandez-moi si besoin.
+// Projet Firebase « Inter-Entreprises » : cette appli a ses propres collections Firestore
+// (foottournoi, foottournoi_messages, teamRosters) et son tag de comptes 'foot24',
+// distincts de ceux de l'autre appli du projet. La collection 'users' (comptes) est commune,
+// chaque compte responsable/inscrit étant étiqueté avec le tag de son tournoi.
 
 const app       = initializeApp(firebaseConfig);
 const auth      = getAuth(app);
@@ -2578,8 +2572,7 @@ function updateRefereesBtnVisibility(){ try{ updateRefProgBtn(); }catch(e){}
   }
 }
 
-// Cette appli partage la collection Firestore 'foottournoi' avec l'appli
-// "Tournoi Vétérans UST 16" (même doc 'current') : on valide/nettoie donc
+// Les données Firestore peuvent contenir des champs inattendus : on valide/nettoie donc
 // systématiquement la forme des données avant de les utiliser, pour éviter
 // tout plantage si un champ inattendu s'y retrouve.
 function sanitizeRefereeAssignments(ra){
@@ -4273,7 +4266,7 @@ function appendFinalRankingBtn(){
 // ══════════════════════════════════════════════════════════
 function getTVSettings(){
   let saved = {};
-  try { saved = JSON.parse(localStorage.getItem('tvSettings')||'{}'); } catch(e){}
+  try { saved = JSON.parse(localStorage.getItem('tvSettings_chal24')||'{}'); } catch(e){}
   return {
     mode:              saved.mode              || 'cycle', // 'results' | 'standings' | 'cycle' (les 2 en alterné)
     intervalMatches:   saved.intervalMatches    || 12,       // secondes d'affichage des écrans "matchs"
@@ -4284,7 +4277,7 @@ function getTVSettings(){
 }
 function saveTVSettings(patch){
   const next = { ...getTVSettings(), ...patch };
-  try { localStorage.setItem('tvSettings', JSON.stringify(next)); } catch(e){}
+  try { localStorage.setItem('tvSettings_chal24', JSON.stringify(next)); } catch(e){}
   return next;
 }
 
